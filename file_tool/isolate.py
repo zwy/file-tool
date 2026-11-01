@@ -255,12 +255,25 @@ def build_isolation_plan(
     dirs = []
     for n in names:
         reason = fscompat.is_windows_unsafe_name(n)
-        if reason:
+        if reason and fscompat.blocks_on_windows(n):
+            # Windows 上根本碰不到这个名字：连 stat 都会失败，
+            # 也判断不出它是目录还是文件，所以这里只记条目。
             plan.unsafe.append(f"{n}（{reason}）")
-            if fscompat.blocks_on_windows(n):
-                continue
-        if (root / n).is_dir():
-            dirs.append(n)
+            continue
+        try:
+            is_dir = (root / n).is_dir()
+        except OSError:
+            is_dir = False
+        if not is_dir:
+            # 平铺文件从来不是隔离候选 —— 不该进 unsafe 列表。
+            # 混进去的话，报告会把它说成「目录」，用户会去找一个并不存在的目录。
+            continue
+        if reason:
+            # macOS 上照常处理（blocks_on_windows 为 False），但要如实报告。
+            # 报告必须和磁盘实际状态对得上：这个目录**会被挪走**，
+            # 不是「已原地保留」。
+            plan.unsafe.append(f"{n}（{reason}）")
+        dirs.append(n)
 
     # 目标目录本身不能被挪进自己
     target_resolved = target.resolve() if target.exists() else target.absolute()

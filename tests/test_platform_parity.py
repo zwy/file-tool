@@ -179,6 +179,145 @@ def test_posix_illegal_filename_is_still_renamed(tmp_path, ruleset):
 
 
 # --------------------------------------------------------------------------
+# 报告必须和磁盘实际状态对得上
+# --------------------------------------------------------------------------
+#
+# Windows 适配给两个平台共用了一套「非法名」文案：
+# 「Windows 上挪不动，已原地保留」。
+# 但这句在两个平台上的事实完全不同 ——
+#
+#   Windows：名字非法，连 stat 都失败，确实被跳过了。
+#   macOS  ：名字完全合法，**照常处理了** —— 目录会被挪走、文件会被分装。
+#
+# 共用文案的结果是：macOS 上目录明明被挪走了，输出却说它「已原地保留」。
+# 用户照这句话判断「哪些文件能安全带去 Windows」，结论正好反过来。
+# 下面几条把这个不变量钉死。
+
+
+@POSIX_ONLY
+def test_posix_isolate_report_matches_disk_state(tmp_path, ruleset):
+    """macOS 上带非法名的目录会被挪走 —— 报告不能说它「已原地保留」。"""
+    from typer.testing import CliRunner
+
+    from file_tool.cli import app
+
+    illegal = tmp_path / "bad:dir"
+    illegal.mkdir()
+    (illegal / "x.txt").write_text("x")
+    target = tmp_path.parent / "gc-target"
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["isolate", str(tmp_path), "--to", str(target), "--apply"]
+    )
+
+    assert result.exit_code == 0, result.output
+    # 磁盘状态：确实挪走了
+    assert not illegal.exists()
+    assert (target / "bad:dir").is_dir()
+    # 报告状态：不能说「已原地保留」（那是谎话），要说清楚本平台照常处理
+    assert "已原地保留" not in result.output
+    assert "本平台已照常处理" in result.output
+
+
+@POSIX_ONLY
+def test_posix_archive_report_does_not_claim_inaccessible(tmp_path):
+    """macOS 上这些文件是能访问的 —— 不能说「Windows 上无法访问」。
+
+    它们留在原地的真实原因是「文件名里没有番号」，不是 Windows。
+    """
+    from typer.testing import CliRunner
+
+    from file_tool.cli import app
+
+    (tmp_path / "a:b.mp4").write_bytes(b"x")
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["archive", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+    # 关键不变量：不能说它「已原地保留」—— 那是 Windows 上的事，
+    # macOS 上这些文件是可以访问的（它们留在原地是因为文件名里没番号）。
+    assert "已原地保留" not in result.output
+    assert "本平台已照常处理" in result.output
+
+
+@POSIX_ONLY
+def test_isolate_unsafe_lists_only_directories(tmp_path, ruleset):
+    """平铺文件不是隔离候选 —— 不该出现在 isolate 的 unsafe 列表里。
+
+    混进去的话，报告会把它说成「目录」—— 用户会去找一个并不存在的目录。
+    """
+    (tmp_path / "a:b.mp4").write_bytes(b"x")   # 平铺文件
+    (tmp_path / "plain").mkdir()               # 普通目录
+
+    target = tmp_path.parent / "gc-target"
+    plan = isolate_mod.build_isolation_plan(tmp_path, target, ruleset)
+
+    assert not any("a:b.mp4" in entry for entry in plan.unsafe)
+
+
+@POSIX_ONLY
+def test_archive_unsafe_lists_only_files(tmp_path):
+    """目录不参与分装 —— 不该出现在 archive 的 unsafe 列表里。"""
+    (tmp_path / "bad:dir").mkdir()
+    (tmp_path / "a:b.mp4").write_bytes(b"x")
+
+    plan = archive_mod.build_archive_plan(tmp_path)
+
+    assert any("a:b.mp4" in entry for entry in plan.unsafe)
+    assert not any("bad:dir" in entry for entry in plan.unsafe)
+
+
+@POSIX_ONLY
+def test_posix_output_keeps_strict_encoding_errors(monkeypatch):
+    """macOS 上输出保持严格编码 —— 编码错误要报出来，不能静默换成 ``?``。
+
+    Windows 上必须降级成 replace（代码页编不出中文会崩），
+    但 POSIX 上默认就是 UTF-8，静默替换只会把真问题藏起来。
+    """
+    import io
+
+    from file_tool import cli as cli_mod
+
+    stream = io.TextIOWrapper(io.BytesIO(), encoding="utf-8", errors="strict")
+    monkeypatch.setattr(cli_mod.sys, "stdout", stream)
+    monkeypatch.setattr(cli_mod.sys, "stderr", stream)
+
+    cli_mod._force_utf8_output()
+
+    assert stream.errors == "strict"
+
+
+def test_rename_case_only_restores_name_on_failure(tmp_path, monkeypatch):
+    """两步改名第二步失败时，名字必须还回去。
+
+    否则文件就卡在 ``__file_tool_tmp__xxx`` 上，原名丢了 ——
+    用户看到的是一个自己从没起过的名字。
+    """
+    real_rename = Path.rename
+
+    def fail_only_the_final_step(self, target):
+        # 只让「临时名 -> 目标名」这一步失败，还名那一步要放行
+        if self.name.startswith(fscompat._TEMP_PREFIX) and str(target).endswith("A.mp4"):
+            raise OSError("boom")
+        return real_rename(self, target)
+
+    monkeypatch.setattr(Path, "rename", fail_only_the_final_step)
+
+    src = tmp_path / "a.mp4"
+    src.write_text("x")
+    dst = tmp_path / "A.mp4"
+
+    with pytest.raises(OSError):
+        fscompat.rename_case_only(src, dst)
+
+    # 文件还在，原名还在，没有残留临时名
+    assert src.exists()
+    assert [p.name for p in tmp_path.iterdir()] == ["a.mp4"]
+
+
+# --------------------------------------------------------------------------
 # 平台无关的核心语义
 # --------------------------------------------------------------------------
 

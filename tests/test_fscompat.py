@@ -192,6 +192,11 @@ def test_raw_name_survives_pathlib_parsing(tmp_path):
     # 对照组：Windows 上用 / 拼会被改写成「驱动器 a: + 文件 b.mp4」
     if os.name == "nt":
         assert (tmp_path / "a:b.mp4").name != "a:b.mp4"
+    else:
+        # POSIX 上 ``:`` 是合法文件名字符，拼出来的名字原样保留。
+        # 明确断言这一条 —— 只在 Windows 上检查的话，
+        # 哪天 POSIX 上被改坏了也不会有人发现。
+        assert (tmp_path / "a:b.mp4").name == "a:b.mp4"
     assert raw.name == "a:b.mp4"
 
 

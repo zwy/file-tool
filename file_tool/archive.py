@@ -213,14 +213,19 @@ def build_archive_plan(
         # Windows 上 ``a:b.mp4`` 会被 pathlib 解析成「驱动器 a: + 文件 b.mp4」，
         # 原始名就丢了，后面既认不出也搬不动。
         reason = fscompat.is_windows_unsafe_name(name)
-        if reason:
+        if reason and fscompat.blocks_on_windows(name):
             plan.unsafe.append(f"{name}（{reason}）")
-            if fscompat.blocks_on_windows(name):
-                continue
+            continue
 
         path = root / name
         if path.is_dir():
+            # 目录不参与分装 —— 不是分装候选，不该进 unsafe 列表
             continue
+        if reason:
+            # macOS 上照常参与分装，但要如实报告。
+            # 「Windows 上无法访问」是一句**跨平台提醒**，
+            # 不是说本平台动不了它 —— 本平台上它完全正常。
+            plan.unsafe.append(f"{name}（{reason}）")
         if is_fork(name):
             plan.forks.append(name)
             continue

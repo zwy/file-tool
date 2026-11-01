@@ -166,19 +166,28 @@ def test_archive_reports_unsafe_names_without_crashing(tmp_path, monkeypatch):
 
 
 def test_isolate_reports_unsafe_dirs_without_crashing(tmp_path, ruleset, monkeypatch):
-    """非法名目录不参与隔离，但要被报告。"""
+    """非法名目录要被报告；平台差异只体现在「是否参与隔离」。
+
+    Windows 上 ``bad:dir`` 连 stat 都会失败，压根建不出来 —— 用假的
+    目录项模拟。macOS 上它是完全合法的名字，能真建出来 —— 就用真的，
+    这样测的才是 macOS 的真实行为。
+    """
     (tmp_path / "SDMM-028C").mkdir()
-    unsafe = Path(str(tmp_path) + os.sep + "bad:dir")
 
-    real_iterdir = Path.iterdir
+    if os.name == "nt":
+        unsafe = Path(str(tmp_path) + os.sep + "bad:dir")
+        real_iterdir = Path.iterdir
 
-    def fake_iterdir(self):
-        for entry in real_iterdir(self):
-            yield entry
-        if self == tmp_path:
-            yield unsafe
+        def fake_iterdir(self):
+            for entry in real_iterdir(self):
+                yield entry
+            if self == tmp_path:
+                yield unsafe
 
-    monkeypatch.setattr(Path, "iterdir", fake_iterdir)
+        monkeypatch.setattr(Path, "iterdir", fake_iterdir)
+    else:
+        (tmp_path / "bad:dir").mkdir()
+        (tmp_path / "bad:dir" / "x.txt").write_text("x")
 
     target = tmp_path.parent / "gc-target"
     plan = isolate_mod.build_isolation_plan(tmp_path, target, ruleset)
@@ -187,6 +196,12 @@ def test_isolate_reports_unsafe_dirs_without_crashing(tmp_path, ruleset, monkeyp
     assert any("bad:dir" in item for item in plan.unsafe)
     # 正常番号目录照常判定
     assert any(i.name == "SDMM-028C" for i in plan.items)
+    if os.name == "nt":
+        # Windows 上挪不动 —— 不参与隔离
+        assert not any(i.name == "bad:dir" for i in plan.move_items)
+    else:
+        # macOS 上名字完全合法 —— 照常隔离
+        assert any(i.name == "bad:dir" for i in plan.move_items)
 
 
 def test_blocks_on_windows_only_blocks_on_windows():

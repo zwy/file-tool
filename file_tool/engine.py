@@ -382,18 +382,27 @@ def apply_plan(root: Path, plan: Plan) -> "ApplyResult":
     renamed: List[Tuple[str, str]] = []
     failed: List[Tuple[str, str]] = []
 
+    # 根目录的条目索引（忽略大小写）建一次 —— 逐条查目录是 O(n²)，
+    # 3000 个顶层目录实测 14 秒。每次改名后同步更新索引。
+    index = fscompat.build_name_index(root)
+
     for item in plan.items:
         if item.action is not Action.RENAME:
             continue
         src = root / item.original
         dst = root / item.target
         if not src.exists():
+            fscompat.index_drop(index, item.original)
             continue
         try:
             # 目标名是否被占用 —— **忽略大小写**判定，见 fscompat.colliding_entries。
             # 不能用 dst.exists()：那取决于卷的大小写语义，会让同一个库
             # 在不同卷上整理出不同结果。
-            blockers = fscompat.colliding_entries(root, item.target)
+            blockers = fscompat.colliding_entries(root, item.target, index)
+            if not blockers and dst.exists():
+                # 索引建好之后、真正改名之前，目标名被别的进程占了 ——
+                # 以磁盘为准。宁可多判一次冲突，也不能覆盖掉别人的文件。
+                blockers = [dst]
             if blockers:
                 same = []
                 others = []
@@ -405,15 +414,19 @@ def apply_plan(root: Path, plan: Plan) -> "ApplyResult":
                 if same and not others:
                     # 仅大小写不同 —— 是同一个文件，必须走两步改名
                     fscompat.rename_case_only(src, dst)
+                    fscompat.index_drop(index, item.original)
+                    fscompat.index_add(index, dst)
                     renamed.append((item.original, dst.name))
                     continue
                 # 真冲突：另一个文件占了目标名，加序号兜底
                 stem, suffix = _split_suffix(item.target)
                 counter = 2
-                while fscompat.colliding_entries(root, f"{stem} ({counter}){suffix}"):
+                while fscompat.colliding_entries(root, f"{stem} ({counter}){suffix}", index):
                     counter += 1
                 dst = root / f"{stem} ({counter}){suffix}"
             src.rename(dst)
+            fscompat.index_drop(index, item.original)
+            fscompat.index_add(index, dst)
             renamed.append((item.original, dst.name))
         except OSError as exc:
             failed.append((item.original, str(exc)))

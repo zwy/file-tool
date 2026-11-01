@@ -18,6 +18,7 @@ import typer
 from file_tool import engine
 from file_tool import archive as archive_mod
 from file_tool import clean as clean_mod
+from file_tool import fscompat
 from file_tool import isolate as isolate_mod
 from file_tool import merge as merge_mod
 from file_tool import rename_files as rename_files_mod
@@ -43,13 +44,51 @@ def _force_utf8_output() -> None:
     ``UnicodeEncodeError`` 崩掉整个 CLI（英文系统上是 cp437，中文根本
     编不出去）。这里强制 UTF-8，并对无法表示的字符降级为替代符 ——
     宁可显示成 ``?``，也不要让工具崩在输出阶段。
+
+    **降级只在 Windows 上做。** POSIX（macOS / Linux）默认就是 UTF-8，
+    而且那里的编码错误是真实问题（文件名里有无法表示的字符），
+    静默替换成 ``?`` 会把问题藏起来 —— 用户看到的是一个合法的文件名，
+    实际磁盘上却是另一个字节序列。因此 POSIX 上一个字节都不改。
     """
     for stream in (sys.stdout, sys.stderr):
         try:
-            stream.reconfigure(encoding="utf-8", errors="replace")
+            if fscompat.on_windows():
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            elif (getattr(stream, "encoding", "") or "").lower().replace("-", "") != "utf8":
+                # POSIX 上只兜底编码，不动错误策略
+                stream.reconfigure(encoding="utf-8")
         except (AttributeError, ValueError, OSError):
             # 被重定向到不支持 reconfigure 的流 —— 忽略，不影响主流程
             pass
+
+
+def _report_unsafe(entries, noun: str) -> None:
+    """报告「在 Windows 上碰不了」的文件名。
+
+    这段话必须分平台说，因为两个平台上的事实不同：
+
+    - **Windows 上**：这些条目**确实被跳过了** —— 名字非法，连 stat 都失败。
+    - **macOS 上**：它们**照常处理了** —— 这些名字在 macOS 上完全合法，
+      只是插到 Windows 上会变成碰不了的僵尸文件。
+
+    早期版本两边都用同一句「已原地保留」，于是 macOS 上会一边把目录
+    挪走了、一边告诉用户它留在原地 —— 报告和磁盘状态自相矛盾，
+    用户据此判断「哪些文件能安全带去 Windows」会得到相反的结论。
+    """
+    if not entries:
+        return
+    sample = ", ".join(entries[:3])
+    if fscompat.on_windows():
+        typer.secho(
+            f"Windows 上无法访问，已跳过（{len(entries)} 个）：{sample}",
+            fg=typer.colors.YELLOW,
+        )
+    else:
+        typer.secho(
+            f"另有 {len(entries)} 个{noun}在 Windows 上无法访问"
+            "（本平台已照常处理；插到 Windows 上前建议先改名）：" + sample,
+            fg=typer.colors.YELLOW,
+        )
 
 
 def _die(message: str) -> None:
@@ -438,11 +477,7 @@ def archive(
             fg=typer.colors.YELLOW,
         )
     if result.get("unsafe"):
-        typer.secho(
-            f"注意：{len(result['unsafe'])} 个文件在 Windows 上无法访问，"
-            "已原地保留（多半是 macOS 在 exFAT 上建的名字）。",
-            fg=typer.colors.YELLOW,
-        )
+        _report_unsafe(result.get("unsafe"), "文件")
     if result["blocked"]:
         typer.secho(
             f"注意：{len(result['blocked'])} 组因目录名与现有文件冲突而未处理："
@@ -493,11 +528,7 @@ def _print_archive_plan(plan) -> None:
             fg=typer.colors.RED,
         )
     if plan.unsafe:
-        typer.secho(
-            f"Windows 上无法访问，原地保留（{len(plan.unsafe)} 个）："
-            f"{', '.join(plan.unsafe[:3])}",
-            fg=typer.colors.YELLOW,
-        )
+        _report_unsafe(plan.unsafe, "文件")
 
 
 @app.command()
@@ -680,10 +711,7 @@ def isolate(
     if result["failed"]:
         typer.secho(f"失败 {len(result['failed'])} 个：{result['failed']}", fg=typer.colors.RED)
     if plan.unsafe:
-        typer.secho(
-            f"另有 {len(plan.unsafe)} 个目录在 Windows 上挪不动，已原地保留。",
-            fg=typer.colors.YELLOW,
-        )
+        _report_unsafe(plan.unsafe, "目录")
 
 
 def _print_isolation_plan(plan) -> None:
@@ -716,11 +744,8 @@ def _print_isolation_plan(plan) -> None:
             fg=typer.colors.YELLOW,
         )
     if plan.unsafe:
-        typer.secho(
-            f"\nWindows 上挪不动，原地保留（{len(plan.unsafe)} 个）："
-            f"{', '.join(plan.unsafe[:3])}",
-            fg=typer.colors.YELLOW,
-        )
+        typer.echo("")
+        _report_unsafe(plan.unsafe, "目录")
 
 
 @app.command()

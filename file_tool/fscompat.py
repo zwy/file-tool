@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 # Windows 保留设备名：这些名字即使带扩展名也不能用（CON.txt 也不行）
 WINDOWS_RESERVED_NAMES = frozenset(
@@ -120,7 +120,49 @@ def same_name_key(name: str) -> str:
     return name.casefold()
 
 
-def colliding_entries(dir_path: Path, name: str) -> List[Path]:
+def build_name_index(dir_path: Path) -> Dict[str, List[Path]]:
+    """目录内容的「忽略大小写」索引：``{比较键: [条目, ...]}``。
+
+    :func:`colliding_entries` 每次调用都要列一遍目录。逐条查就是
+    **O(n²)** —— 3000 个顶层目录就是 900 万次名字比较，实测 14 秒。
+    建一次索引、之后按键查就是 O(1)。
+
+    索引是**快照**：改名之后必须用 :func:`index_drop` / :func:`index_add`
+    同步，否则它会跟磁盘对不上。
+    """
+    index: Dict[str, List[Path]] = {}
+    try:
+        entries = list(dir_path.iterdir())
+    except OSError:
+        return index
+    for p in entries:
+        index.setdefault(same_name_key(p.name), []).append(p)
+    return index
+
+
+def index_drop(index: Dict[str, List[Path]], name: str) -> None:
+    """索引里删掉一个名字（改名之后调用）。"""
+    key = same_name_key(name)
+    bucket = index.get(key)
+    if not bucket:
+        return
+    remaining = [p for p in bucket if p.name != name]
+    if remaining:
+        index[key] = remaining
+    else:
+        index.pop(key, None)
+
+
+def index_add(index: Dict[str, List[Path]], path: Path) -> None:
+    """索引里加进一个条目（改名之后调用）。"""
+    index.setdefault(same_name_key(path.name), []).append(path)
+
+
+def colliding_entries(
+    dir_path: Path,
+    name: str,
+    index: Optional[Dict[str, List[Path]]] = None,
+) -> List[Path]:
     """目录里所有「忽略大小写后与 ``name`` 相同」的条目。
 
     这是「目标名是否已被占用」的**唯一**判定入口，替代
@@ -141,13 +183,14 @@ def colliding_entries(dir_path: Path, name: str) -> List[Path]:
 
     返回列表而不是单个路径：大小写敏感的卷上真可能同时存在
     ``a.mp4`` 和 ``A.mp4``，两个都是占用者。
+
+    ``index`` 是可选的预建索引（见 :func:`build_name_index`）——
+    批量改名时传进来，避免反复列目录。
     """
     key = same_name_key(name)
-    try:
-        entries = list(dir_path.iterdir())
-    except OSError:
-        return []
-    return [p for p in entries if same_name_key(p.name) == key]
+    if index is None:
+        index = build_name_index(dir_path)
+    return list(index.get(key, []))
 
 
 def find_unsafe_names(
@@ -183,6 +226,14 @@ def to_posix_relpath(path: Path, root: Path) -> str:
     每一段，``a:b.mp4`` 被读成「驱动器 a: + 文件 b.mp4」。
 
     自己按 ``parts`` 逐段比较，既跨版本稳定，也保得住原始名。
+
+    **必须整段 root 都匹配上**才算 path 在 root 底下。
+    只比对到「第一段不就停」是不够的 —— POSIX 上绝对路径的第一段
+    永远是 ``/``，所以「不在 root 下」这个判断根本不会触发，
+    结果会返回一个**看着像相对路径、其实是错的**东西
+    （``/other/a.mp4`` 会被算成 ``other/a.mp4``）。
+    那种情况下必须退回绝对路径 —— 宁给个绝对路径，
+    也不能给一个会骗人的相对路径。
     """
     path_parts = path.parts
     root_parts = root.parts
@@ -192,8 +243,8 @@ def to_posix_relpath(path: Path, root: Path) -> str:
     while index < limit and _same_part(path_parts[index], root_parts[index]):
         index += 1
 
-    if index == 0:
-        # 根本不在 root 底下（不同盘 / 不同根）—— 退回绝对路径
+    if index != len(root_parts):
+        # root 没有被完整匹配上 —— path 不在 root 底下（不同盘 / 不同根）
         return path.as_posix()
 
     rel_parts = path_parts[index:]
@@ -251,6 +302,10 @@ def rename_case_only(src: Path, dst: Path) -> None:
     是同一个文件，名字里的那点大小写差异被忽略了。
 
     前提：``dst`` 指向的就是 ``src`` 本身（用 :func:`is_same_file` 判定）。
+
+    第二步失败时会把名字**还回去** —— 否则文件就卡在
+    ``__file_tool_tmp__xxx`` 这个临时名上，原名丢了，
+    用户看到的是一个自己从没起过的名字。
     """
     tmp = src.with_name(f"{_TEMP_PREFIX}{src.suffix}")
     counter = 0
@@ -258,4 +313,11 @@ def rename_case_only(src: Path, dst: Path) -> None:
         counter += 1
         tmp = src.with_name(f"{_TEMP_PREFIX}{counter}{src.suffix}")
     src.rename(tmp)
-    tmp.rename(dst)
+    try:
+        tmp.rename(dst)
+    except OSError:
+        try:
+            tmp.rename(src)   # 还回原名，别把文件卡在临时名上
+        except OSError:
+            pass
+        raise

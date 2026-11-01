@@ -223,3 +223,102 @@ def test_relpath_keeps_colon_in_middle_segment(tmp_path):
     fake = Path(str(tmp_path / "ok") + os.sep + "a:b" + os.sep + "x.mp4")
 
     assert fscompat.to_posix_relpath(fake, tmp_path) == "ok/a:b/x.mp4"
+
+
+# --------------------------------------------------------------------------
+# 相对路径：不在 root 底下时必须退回绝对路径
+# --------------------------------------------------------------------------
+
+
+def test_relpath_outside_root_falls_back_to_absolute(tmp_path):
+    """路径不在 root 底下时，必须给绝对路径。
+
+    按 ``parts`` 逐段比对有个坑：POSIX 上绝对路径的第一段永远是 ``/``，
+    所以「第一段就不一样 -> 退回绝对路径」这个判断**永远不触发**，
+    结果会返回一个看着像相对路径、其实是错的东西
+    （``/other/a.mp4`` 被算成 ``other/a.mp4``）。
+
+    旧实现（``relative_to`` 抛 ``ValueError`` 时）给的是绝对路径 ——
+    宁可给个绝对路径，也不能给一个会骗人的相对路径。
+    """
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "other" / "a.mp4"
+    outside.parent.mkdir()
+    outside.write_bytes(b"x")
+
+    rel = fscompat.to_posix_relpath(outside, root)
+    assert rel == outside.as_posix()
+
+
+def test_relpath_when_root_is_a_subpath_falls_back_to_absolute(tmp_path):
+    """root 是源目录的子路径时同样退回绝对路径。"""
+    outside = tmp_path / "a" / "b.mp4"
+    outside.parent.mkdir(parents=True)
+    outside.write_bytes(b"x")
+    root = tmp_path / "a" / "b" / "c"
+
+    rel = fscompat.to_posix_relpath(outside, root)
+    assert rel == outside.as_posix()
+
+
+# --------------------------------------------------------------------------
+# 占用索引：必须是活的快照，不能是死的
+# --------------------------------------------------------------------------
+
+
+def test_apply_plan_index_tracks_freed_names(tmp_path):
+    """改名腾出来的名字，后面要用的话必须还能用。
+
+    占用判定走索引（建一次、按键查），但索引是**快照** ——
+    改名之后必须同步更新，否则会被误判成冲突、加上 ``(2)`` 后缀。
+    """
+    from file_tool.models import Plan, PlanItem
+
+    (tmp_path / "a").mkdir()
+    (tmp_path / "c").mkdir()
+
+    plan = Plan(
+        root=str(tmp_path),
+        items=[
+            PlanItem(original="a", target="b", action=Action.RENAME),
+            PlanItem(original="c", target="a", action=Action.RENAME),
+        ],
+    )
+    done = engine.apply_plan(tmp_path, plan)
+
+    assert not done.failed
+    # "a" 先被腾空，再被 "c" 占用 —— 没有多出 "a (2)"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["a", "b"]
+
+
+def test_apply_plan_checks_disk_before_overwriting(tmp_path, monkeypatch):
+    """索引建好之后目标名被别人占了 —— 必须以磁盘为准，不能覆盖。
+
+    索引是快照，看不见「建好之后才出现」的文件。
+    这一条是索引优化必须带的安全网：宁可多判一次冲突，
+    也不能把别人的文件盖掉。
+    """
+    from file_tool.models import Plan, PlanItem
+
+    (tmp_path / "a").write_text("mine")
+
+    real_build = fscompat.build_name_index
+
+    def build_then_sneak(dir_path):
+        index = real_build(dir_path)
+        (dir_path / "b").write_text("theirs")   # 索引建好之后才出现
+        return index
+
+    monkeypatch.setattr(fscompat, "build_name_index", build_then_sneak)
+
+    plan = Plan(
+        root=str(tmp_path),
+        items=[PlanItem(original="a", target="b", action=Action.RENAME)],
+    )
+    done = engine.apply_plan(tmp_path, plan)
+
+    # 别人的文件没被覆盖，我们的改名让到了序号上
+    assert (tmp_path / "b").read_text() == "theirs"
+    assert (tmp_path / "b (2)").read_text() == "mine"
+    assert not done.failed

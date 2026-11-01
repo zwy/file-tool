@@ -36,14 +36,6 @@ def _sanitize(value: str) -> str:
     return value.replace("::", " > ").replace(",", " ").replace("\n", " ").replace("\r", " ")
 
 
-def pytest_terminal_summary(terminalreporter, exitstatus, config):
-    """失败 / 错误时输出 GitHub Actions 注释。
-
-    只在 CI 里生效 —— 本地跑不需要这些噪音。
-    """
-    if not os.environ.get("GITHUB_ACTIONS"):
-        return
-
 def _failure_message(report) -> str:
     """取失败的原因（异常那行）。
 
