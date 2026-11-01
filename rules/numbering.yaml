@@ -43,6 +43,16 @@ description: "日本成人影片（番号）目录名规范化：去水印域名
 # 所以：凡是本文件产出过的形态，都必须能被本文件重新解析。
 # 改动任何一条 match 规则后，请对全库跑一次 rename 预览，确认破坏数为 0。
 
+# 水印域名的后缀白名单
+# --------------------
+# 用 ``{tlds}`` 占位，加载时由 engine 注入实际列表。
+# 以前这份列表在 5 条规则里各抄一遍，抄漏一个就有一条规则认不出那种域名 ——
+# 实测踩过的坑：G 盘的 ``wbrr.life@ADN-683CX.mp4`` 因为 ``.life`` 没抄进去，
+# 剥不掉域名，文件名就一直规范化不了。现在只有 engine.py 一处要改。
+#
+# 为什么是白名单而不是「任意后缀都行」：白名单能挡住
+# ``xxx.jpg@番号`` 这类**文件名**里的 @，避免把图片名当域名剥掉。
+
 preprocess:
   # 注意顺序：先捕获「域名里带 (N)」的副本标记，再剥域名。
   # 剥完域名后 (N) 已经不在串里，就再也捕不到了。
@@ -53,19 +63,36 @@ preprocess:
 
   - name: strip_double_watermark_domain
     description: "剥掉双重水印域名，如 aavv36.xyz@aavv36.xyz@SDMM095 -> SDMM095（单层规则只剥一次，剥不掉）"
-    pattern: '^(?:[A-Za-z0-9._()\-]+\.(?:com|net|org|xyz|cc|tv|me|info|top|club|shop|wang|live|site|space|pw|fun|icu|vip)@){2}'
+    pattern: '^(?:[A-Za-z0-9._()\-]+\.(?:{tlds})@){2}'
+
+  - name: strip_trailing_domain
+    description: "剥掉尾部的水印域名，如 SDMM128Caavv38.xyz@ -> SDMM128C（番号在前、域名在后的形态）"
+    # 番号段只含大写字母和数字，域名段含小写 —— 用大小写把两段分开。
+    # 不能写成 `^(?P<code>.+?)(?P<domain>...)@$`：号码段用惰性匹配会只吃到 1 个字符，
+    # 域名段的字符类又允许大写，结果整串被当成域名剥光（core 变空串）。
+    pattern: '^(?P<code>[A-Z0-9]+)(?P<domain>[a-z0-9._\-]*\.[a-z]{2,})@$'
+    replacement: '\g<code>'
 
   - name: strip_watermark_domain
     description: "剥掉前缀水印域名，如 aavv38.xyz@SDMM028 -> SDMM028"
-    pattern: '^(?P<domain>[A-Za-z0-9._()\-]+\.(?:com|net|org|xyz|cc|tv|me|info|top|club|shop|wang|live|site|space|pw|fun|icu|vip))@'
+    pattern: '^(?P<domain>[A-Za-z0-9._()\-]+\.(?:{tlds}))@'
     capture: domain
+
+  - name: strip_joined_domain
+    description: "剥掉与番号直接相连的前缀域名（无 @ 分隔），如 dxxdom.comSONE815 -> SONE815"
+    # 形态：域名后面**紧贴**番号，中间没有 @ 也没有空格。
+    # 与 strip_watermark_domain 的区别就在这里 —— 那条要求域名后面是 @。
+    # 域名段全小写、番号段以大写字母开头，用大小写把两段切开。
+    # 番号段允许连字符（KIN8-4069 这种厂牌自带数字），但不允许下划线
+    # 和空格 —— 否则会把站点后缀（_uncensored 之类）一起吞进来。
+    pattern: '^(?P<domain>[a-z0-9][a-z0-9._\-]*\.(?:{tlds}))(?P<code>[A-Z][A-Za-z0-9\-]*)$'
+    replacement: '\g<code>'
 
   - name: strip_paren_dup
     description: "剥掉尾部重复副本标记 (1)（连前导空格一起剥 —— 否则规范名 'X-001 (1)' 反解不回来）"
     pattern: '\s*\((?P<dup>\d+)\)$'
     capture: dup
     conditional: true
-
   - name: strip_space_dup
     description: "剥掉尾部空格+数字重复标记 ' 2'"
     pattern: ' (?P<dup>\d+)$'
@@ -81,6 +108,20 @@ preprocess:
   - name: strip_hd_prefix
     description: "剥掉 HD_ 前缀"
     pattern: '^HD_'
+
+  # ---- 以下三条是后来观察到的下载站形态 ----
+
+  - name: strip_dash_domain
+    description: "剥掉用横杠分隔的域名，如 htbet166.com-OKK007C -> OKK007C"
+    pattern: '^(?P<domain>[A-Za-z0-9._()\-]+\.(?:{tlds}))-'
+
+  - name: strip_space_domains
+    description: "剥掉用空格分隔的多个域名，如 madoubt.com 853252.xyz DOKS-657 -> DOKS-657"
+    pattern: '^(?:[A-Za-z0-9._()\-]+\.(?:{tlds})\s+)+'
+
+  - name: strip_quality_suffix
+    description: "剥掉画质后缀，如 STARS-542.HD -> STARS-542"
+    pattern: '(?i:\.HD)$'
 
 matches:
   # ---- 这里**没有**日期型规则 ----
@@ -98,6 +139,14 @@ matches:
     dup_suffix: ' ({dup})'
     priority: 95
 
+  # ---- 厂牌-数字-版本（版本后缀前带横杠），如 ABF-292-AI ----
+  - name: studio_dash_num_dash_ver
+    description: "厂牌-序号-版本形 ABF-292-AI（版本后缀前带横杠）"
+    pattern: '^(?P<studio>[A-Z]{2,6})-(?P<num>\d{2,6})-(?P<ver>[A-Z]{1,3})$'
+    template: '{studio}-{num}-{ver}'
+    dup_suffix: ' ({dup})'
+    priority: 92
+
   # ---- 厂牌-数字（带横杠），如 MAAN-961 / IPZZ-118C / SSIS-863C ----
   - name: studio_dash_num
     description: "厂牌-序号形 MAAN-961 / IPZZ-118C / SSIS-863C"
@@ -114,6 +163,15 @@ matches:
     dup_suffix: ' ({dup})'
     priority: 85
 
+  # ---- 数字前缀 + 厂牌数字（**无横杠**），如 230ORECO894C ----
+  # 与上面那条只差一个横杠，但下载站两个形态都出现过。
+  - name: prefix_num_studio_nodash
+    description: "带数字前缀但厂牌与序号之间无横杠 230ORECO894C"
+    pattern: '^(?P<prefix>\d{2,4})(?P<studio>[A-Z]{3,6})(?P<num>\d{2,6})(?P<ver>[A-Z]{0,3})$'
+    template: '{studio}-{num}{ver}'
+    dup_suffix: ' ({dup})'
+    priority: 84
+
   # ---- 厂牌+数字（无横杠），如 SDMM028C / MON004 / CAWD660CX ----
   - name: studio_num_ver
     description: "厂牌序号形 SDMM028C / MON004 / CAWD660CX"
@@ -127,6 +185,25 @@ matches:
   # 不当番号处理的好处：目录名匹配不上番号规则 -> isolate 会把它判为
   # 「不符合番号规范」而挪到国产文件夹（GC），番号库里就不留国产内容了。
 
+  # ---- 大写厂牌含数字带横杠，如 KIN8-4069 ----
+  # 与下面的 lower_dash_digit_studio 是同一形态的大写版（KIN8 是厂牌名的一部分）。
+  # 放在 studio_dash_num 之后：KIN8-4069 的厂牌段含数字，
+  # studio_dash_num 要求厂牌是纯字母，本来就匹配不上，顺序不影响结果。
+  - name: upper_dash_digit_studio
+    description: "大写厂牌含数字带横杠 KIN8-4069"
+    pattern: '^(?P<studio>[A-Z]{2,6}\d{1,2})-(?P<num>\d{1,8})(?P<ver>[A-Z]{1,3})?$'
+    template: '{studio}-{num}{ver}'
+    dup_suffix: ' ({dup})'
+    priority: 69
+
+  # ---- 小写厂牌含数字带横杠，如 kin8-3980 ----
+  - name: lower_dash_digit_studio
+    description: "小写厂牌含数字带横杠 kin8-3980"
+    pattern: '^(?P<studio>[a-z]{2,6}\d{1,2})-(?P<num>\d{1,8})(?P<ver>-[A-Za-z]{1,3}|[A-Za-z]{1,3})?$'
+    template: '{studio}-{num}{ver}'
+    dup_suffix: ' ({dup})'
+    priority: 71
+
   # ---- 小写厂牌带横杠，如 avop-235-C / sdmu-00877b ----
   # 版本后缀可能是大写（C）也可能是小写（b），两种都要收
   - name: lower_dash
@@ -135,6 +212,14 @@ matches:
     template: '{studio}-{num}{ver}'
     dup_suffix: ' ({dup})'
     priority: 70
+
+  # ---- 3 位小写厂牌无横杠，如 sgm00030 ----
+  - name: lower_code_short_studio
+    description: "3 位小写厂牌序号形 sgm00030"
+    pattern: '^(?P<studio>[a-z]{3})(?P<num>\d{3,8})(?P<ver>[a-z]{0,2})$'
+    template: '{studio}-{num}{ver}'
+    dup_suffix: ' ({dup})'
+    priority: 66
 
   # ---- 小写厂牌 + 数字（可带小写版本后缀），如 xfxfz14468 / dvdms00300a ----
   - name: lower_code

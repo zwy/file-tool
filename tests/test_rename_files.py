@@ -172,6 +172,51 @@ def test_existing_target_is_conflict(tmp_path, ruleset):
     assert item.target == "CLUB-810.mp4"
 
 
+def test_case_only_difference_is_not_a_conflict(tmp_path, ruleset):
+    """仅大小写不同 -> 不是冲突，是纯大小写改名。
+
+    实测 G 盘踩到的坑：目录名是 ``club-880``（小写），文件名是
+    ``CLUB-880.mp4``（大写）。目录名规范化后目标名是 ``club-880.mp4``，
+    而在 exFAT / APFS（默认）这种大小写不敏感的卷上，
+    ``Path.exists()`` 判定「已存在」恒为真 —— 明明是同一个文件，
+    却被判成冲突，文件名就永远规范化不了。
+
+    正确判定靠文件身份（inode + 设备号），不是路径字符串。
+    """
+    make(tmp_path, "club-880/CLUB-880.mp4")
+    plan = plan_for(tmp_path, ruleset)
+    item = find(plan, "club-880/CLUB-880.mp4")
+    assert item is not None
+    assert item.action is rf.FileAction.RENAME, "仅大小写不同不该判成冲突"
+    assert item.target == "club-880.mp4"
+
+
+def test_case_only_rename_actually_applies(tmp_path, ruleset):
+    """纯大小写改名要真的落地（两步改名），不能「无事发生」。
+
+    断言方式说明：Windows / exFAT / APFS 默认都是大小写不敏感的，
+    ``Path.exists()`` 对 ``CLUB-880.mp4`` 和 ``club-880.mp4`` 都返回 True ——
+    那是同一个文件。所以只能看**目录列表里实际存的名字**。
+    """
+    make(tmp_path, "club-880/CLUB-880.mp4", "payload")
+    plan = plan_for(tmp_path, ruleset)
+    result = rf.apply_file_plan(tmp_path, plan)
+    assert len(result["renamed"]) == 1
+
+    names = sorted(p.name for p in (tmp_path / "club-880").iterdir())
+    assert names == ["club-880.mp4"], f"实际文件名 {names}"
+    assert (tmp_path / "club-880" / "club-880.mp4").read_text() == "payload"
+
+
+def test_real_conflict_with_different_case_is_still_conflict(tmp_path, ruleset):
+    """真的是两个文件（哪怕只差大小写）-> 仍然是冲突，绝不覆盖。"""
+    make(tmp_path, "CLUB-810/CLUB810.mp4", "new")
+    make(tmp_path, "CLUB-810/club-810.mp4", "original")
+    plan = plan_for(tmp_path, ruleset)
+    item = find(plan, "CLUB-810/CLUB810.mp4")
+    assert item.action is rf.FileAction.CONFLICT
+
+
 # --------------------------------------------------------------------------
 # 执行
 # --------------------------------------------------------------------------

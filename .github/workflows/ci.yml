@@ -12,7 +12,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # macOS / Linux / Windows 三平台 —— Windows 必须进矩阵：
+        # 文件名规则、大小写语义、占用行为三处差异只有真机才暴露得了。
+        os: [ubuntu-latest, macos-latest, windows-latest]
         python-version: ["3.11", "3.12", "3.13"]
 
     steps:
@@ -32,3 +34,13 @@ jobs:
 
       - name: 校验规则文件可加载
         run: python -c "from file_tool import engine; from pathlib import Path; engine.load_ruleset(Path('rules/numbering.yaml')); print('rules ok')"
+
+      - name: 校验 CLI 能启动并输出中文
+        # Windows 控制台默认代码页（cp437 / cp1252 / GBK）编不出中文时，
+        # CLI 会在输出阶段 UnicodeEncodeError 崩掉。这里显式模拟非 UTF-8
+        # 代码页，确保 _force_utf8_output 兜住了。
+        shell: bash
+        run: |
+          PYTHONIOENCODING=cp1252 python -m file_tool.cli rules show > /dev/null
+          PYTHONIOENCODING=cp1252 python -m file_tool.cli --help > /dev/null
+          echo "cli ok"

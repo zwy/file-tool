@@ -20,6 +20,14 @@ htmlcov/
 .idea/
 .vscode/
 *.swp
+# Windows
+Thumbs.db
+ehthumbs.db
+desktop.ini
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+*.stackdump
 
 # 本地规则覆盖（可能含个人路径或私有规则）
 rules/local*.yaml

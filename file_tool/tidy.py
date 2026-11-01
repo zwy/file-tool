@@ -45,6 +45,7 @@ from file_tool import archive as archive_mod
 from file_tool import engine
 from file_tool import isolate as isolate_mod
 from file_tool import merge as merge_mod
+from file_tool import rename_files as rename_files_mod
 from file_tool.models import Action, RuleSet
 
 
@@ -60,11 +61,12 @@ class Shape(str, Enum):
 class StepKind(str, Enum):
     """计划中的动作类型。"""
 
-    CLEAN = "clean"      # 清理系统垃圾文件
-    ISOLATE = "isolate"  # 隔离不符合规范的目录
-    ARCHIVE = "archive"  # 平铺文件分装
-    MERGE = "merge"      # 合并重复目录
-    RENAME = "rename"    # 改名
+    CLEAN = "clean"          # 清理系统垃圾文件
+    ISOLATE = "isolate"      # 隔离不符合规范的目录
+    ARCHIVE = "archive"      # 平铺文件分装
+    MERGE = "merge"          # 合并重复目录
+    RENAME = "rename"        # 改名（目录名）
+    RENAME_FILES = "rename-files"  # 改名（文件名里的番号）
 
 
 class TidyStep(BaseModel):
@@ -182,10 +184,13 @@ def build_tidy_plan(
     ruleset: RuleSet,
     names: Optional[Sequence[str]] = None,
     isolate_to: Optional[Path] = None,
+    rename_file_names: bool = True,
 ) -> TidyPlan:
     """生成智能整理计划。
 
     ``isolate_to`` 非空时，额外加入「隔离不符合规范的目录」步骤。
+
+    ``rename_file_names=False`` 时不做文件名规范化（只改目录名）。
     """
     if names is None:
         names = sorted(p.name for p in root.iterdir())
@@ -321,6 +326,27 @@ def build_tidy_plan(
                 + ("…" if len(skipped) > 5 else "")
             )
 
+    # ---- Step 4: rename-files（文件名里的番号规范化）----
+    # 必须在 rename 之后：文件名的目标来自**所在目录的规范名**，
+    # 目录名先规范化，文件才有正确的目标可对。
+    if rename_file_names and shape in (Shape.NESTED, Shape.MIXED):
+        file_plan = rename_files_mod.build_file_plan(root, ruleset)
+        if file_plan.rename_items:
+            plan.steps.append(
+                TidyStep(
+                    kind=StepKind.RENAME_FILES,
+                    detail="把文件名里的番号规范化成所在目录的番号",
+                    count=len(file_plan.rename_items),
+                    names=[i.relpath for i in file_plan.rename_items],
+                )
+            )
+        if file_plan.conflict_items:
+            plan.notes.append(
+                f"{len(file_plan.conflict_items)} 个文件的目标名已被占用，保持原样："
+                + ", ".join(i.relpath for i in file_plan.conflict_items[:3])
+                + ("…" if len(file_plan.conflict_items) > 3 else "")
+            )
+
     if not plan.steps:
         plan.notes.append("目录已经是规范状态，无需改动。")
 
@@ -345,9 +371,11 @@ def apply_tidy_plan(
         "merged": 0,
         "archived": 0,
         "renamed": 0,
+        "renamed_files": 0,
         "isolated": 0,
         "forks_removed": 0,
         "conflicts": 0,
+        "failed": 0,
     }
 
     for step in plan.steps:
@@ -374,6 +402,7 @@ def apply_tidy_plan(
                     root, isolate_to, iso_plan
                 )
                 result["isolated"] = len(iso_result["moved"])
+                result["failed"] = int(result["failed"]) + len(iso_result["failed"])
                 names = sorted(p.name for p in root.iterdir())
 
         elif step.kind is StepKind.MERGE:
@@ -384,6 +413,9 @@ def apply_tidy_plan(
             result["merged"] = sum(
                 1 for r in merge_results if r["action"] == merge_mod.MergeAction.MERGE.value
             )
+            result["failed"] = int(result["failed"]) + sum(
+                len(r.get("failed", [])) for r in merge_results
+            )
             names = sorted(p.name for p in root.iterdir())
 
         elif step.kind is StepKind.ARCHIVE:
@@ -393,12 +425,25 @@ def apply_tidy_plan(
             )
             result["archived"] = archive_result["moved"]
             result["conflicts"] = archive_result["conflicts"]
+            result["failed"] = int(result["failed"]) + len(archive_result["failed"])
             names = sorted(p.name for p in root.iterdir())
 
         elif step.kind is StepKind.RENAME:
-            rename_plan = engine.build_plan(root, ruleset, names)
+            # 只把**目录**交给改名引擎 —— 文件由 archive / rename-files 处理。
+            # 这里必须和 build_tidy_plan 用同一份名单（规划阶段也是只用目录名），
+            # 否则顶层散文件会被当成目录一起改名。
+            dir_names = [n for n in names if (root / n).is_dir()]
+            rename_plan = engine.build_plan(root, ruleset, dir_names)
             done = engine.apply_plan(root, rename_plan)
-            result["renamed"] = len(done)
+            result["renamed"] = len(done.renamed)
+            result["failed"] = int(result["failed"]) + len(done.failed)
             names = sorted(p.name for p in root.iterdir())
+
+        elif step.kind is StepKind.RENAME_FILES:
+            file_plan = rename_files_mod.build_file_plan(root, ruleset)
+            file_result = rename_files_mod.apply_file_plan(root, file_plan)
+            result["renamed_files"] = len(file_result["renamed"])
+            result["conflicts"] = int(result["conflicts"]) + len(file_result["conflicts"])
+            result["failed"] = int(result["failed"]) + len(file_result["failed"])
 
     return result

@@ -74,7 +74,7 @@ def build_clean_plan(root: Path, recursive: bool = True) -> CleanPlan:
             if fork.is_file():
                 plan.items.append(CleanItem(
                     path=str(fork),
-                    size=fork.stat().st_size,
+                    size=_safe_size(fork),
                     has_counterpart=True,
                 ))
             continue
@@ -87,11 +87,19 @@ def build_clean_plan(root: Path, recursive: bool = True) -> CleanPlan:
         counterpart = path.parent / path.name[2:]
         plan.items.append(CleanItem(
             path=str(path),
-            size=path.stat().st_size,
+            size=_safe_size(path),
             has_counterpart=counterpart.exists(),
         ))
 
     return plan
+
+
+def _safe_size(path: Path) -> int:
+    """取文件大小；取不到就当 0（被占用 / 无权限 / 名字非法）。"""
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
 
 
 def apply_clean_plan(plan: CleanPlan) -> Dict[str, object]:

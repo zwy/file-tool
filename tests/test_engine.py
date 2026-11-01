@@ -255,7 +255,8 @@ def test_apply_plan_renames_on_disk(tmp_path):
     names = sorted(p.name for p in tmp_path.iterdir())
     plan = engine.build_plan(tmp_path, ruleset, names)
     done = engine.apply_plan(tmp_path, plan)
-    assert len(done) == 2
+    assert len(done.renamed) == 2
+    assert not done.failed
     assert (tmp_path / "SDMM-028C").is_dir()
     assert (tmp_path / "MIDE-004").is_dir()
 

@@ -1,0 +1,157 @@
+"""跨平台文件系统兼容层。
+
+macOS 与 Windows 在**文件名规则、大小写语义、占用行为**上有实质差异。
+这些差异如果不收敛到一处，就会散落到每个业务模块里 —— 而且每一处
+都是「在 macOS 上测不出来、到 Windows 上炸」的坑。
+
+本模块只做三件事：
+
+1. **文件名合法性**
+   Windows 有一批 macOS 允许、Windows 不允许的名字：保留设备名
+   （``CON`` / ``NUL`` / ``COM1``）、非法字符（``< > : " / \\ | ? *``）、
+   以及结尾的点和空格（会被静默剥掉）。
+
+   exFAT 在 macOS 上允许建出带 ``:`` 的文件名，插到 Windows 上就成了
+   碰不了的僵尸文件 —— ``stat`` 直接报「文件名无效」。所以扫描时必须
+   提前发现并报告，而不是等移动时炸掉。
+
+2. **大小写**
+   Windows NTFS/exFAT 与 macOS APFS（默认）都**大小写不敏感**，
+   「只改大小写」的改名必须走两步（先挪临时名），否则 rename 会
+   「无事发生」—— 系统认为源和目标是同一个文件。
+
+3. **路径表示**
+   相对路径统一用 ``/`` 分隔，保证 JSON 输出与日志跨平台一致。
+   ``str(Path.relative_to())`` 在 Windows 上给的是 ``\\``，会让
+   下游脚本在两个平台长得不一样。
+"""
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+# Windows 保留设备名：这些名字即使带扩展名也不能用（CON.txt 也不行）
+WINDOWS_RESERVED_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)}
+)
+
+# Windows 文件名非法字符
+WINDOWS_ILLEGAL_CHARS = '<>:"/\\|?*'
+
+# 单个文件名（一个路径段）的长度上限
+MAX_NAME_LENGTH = 255
+
+# 两步改名时用的临时名前缀
+_TEMP_PREFIX = "__file_tool_tmp__"
+
+
+def on_windows() -> bool:
+    """当前是否运行在 Windows 上。"""
+    return os.name == "nt"
+
+
+def blocks_on_windows(name: str) -> bool:
+    """这个名字在**当前平台**上是不是根本用不了。
+
+    只有 Windows 会卡住 —— macOS / Linux 上这些名字完全合法，
+    甚至改名能顺手把问题修掉。所以「拦不拦」取决于当前平台，
+    但「要不要告诉用户」是另一回事，两件事要分开看。
+    """
+    return on_windows() and is_windows_unsafe_name(name) is not None
+
+
+def is_windows_unsafe_name(name: str) -> Optional[str]:
+    """判断这个名字在 Windows 上能不能用。
+
+    返回不可用的原因；可用则返回 ``None``。
+
+    只在 Windows 上有实际意义 —— macOS / Linux 允许这些名字，
+    但它们一旦出现在与 macOS 共用的 exFAT 卷上，插到 Windows 上
+    就会变成碰不了的文件。
+    """
+    if not name:
+        return "空文件名"
+    if name in (".", ".."):
+        return "相对路径标记"
+
+    # 保留设备名看的是第一个点之前那一段：CON.txt 和 CON 一样是保留名
+    stem = name.split(".", 1)[0].rstrip(" ").upper()
+    if stem in WINDOWS_RESERVED_NAMES:
+        return f"Windows 保留设备名（{stem}）"
+
+    illegal = sorted({c for c in name if c in WINDOWS_ILLEGAL_CHARS or ord(c) < 32})
+    if illegal:
+        return "Windows 非法字符：" + "".join(illegal)
+
+    if name[-1] in (".", " "):
+        return "Windows 会静默剥掉结尾的点和空格"
+
+    if len(name) > MAX_NAME_LENGTH:
+        return f"文件名超过 {MAX_NAME_LENGTH} 字符"
+
+    return None
+
+
+def find_unsafe_names(
+    root: Path, recursive: bool = True
+) -> List[Tuple[str, str]]:
+    """扫出 root 下在 Windows 上不可用的文件名。
+
+    返回 ``[(相对路径, 原因)]``，相对路径用 ``/`` 分隔。
+
+    走 ``rglob`` 而不是 ``Path.__truediv__``：Windows 上 ``a:b.mp4``
+    这种名字会被 pathlib 解析成「驱动器 a: + 文件 b.mp4」，
+    ``.name`` 拿到的是 ``b.mp4``，冒号被吃掉，检测就失效了。
+    ``rglob`` 内部用 ``_make_child_relpath`` 拼路径，原始名能保住。
+    """
+    found: List[Tuple[str, str]] = []
+    walker = root.rglob("*") if recursive else root.iterdir()
+    for path in walker:
+        reason = is_windows_unsafe_name(path.name)
+        if reason:
+            found.append((to_posix_relpath(path, root), reason))
+    return found
+
+
+def to_posix_relpath(path: Path, root: Path) -> str:
+    """相对 root 的相对路径，统一用 ``/`` 分隔。
+
+    跨平台的 JSON 输出、下游脚本、日志比对都依赖这个表示统一。
+    """
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
+def is_same_file(a: Path, b: Path) -> bool:
+    """两个路径是否指向同一个文件（或目录）。
+
+    用于区分「目标已存在且是另一个文件」和「目标就是源本身，
+    只是大小写不同」—— 后者必须走两步改名，不能当成冲突。
+    """
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
+def rename_case_only(src: Path, dst: Path) -> None:
+    """只差大小写的改名：先挪到临时名，再改到目标名。
+
+    大小写不敏感的卷（Windows NTFS/exFAT、macOS APFS 默认）上，
+    直接 ``src.rename(dst)`` 会「无事发生」—— 系统认为源和目标
+    是同一个文件，名字里的那点大小写差异被忽略了。
+
+    前提：``dst`` 指向的就是 ``src`` 本身（用 :func:`is_same_file` 判定）。
+    """
+    tmp = src.with_name(f"{_TEMP_PREFIX}{src.suffix}")
+    counter = 0
+    while tmp.exists():
+        counter += 1
+        tmp = src.with_name(f"{_TEMP_PREFIX}{counter}{src.suffix}")
+    src.rename(tmp)
+    tmp.rename(dst)

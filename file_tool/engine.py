@@ -17,7 +17,9 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import yaml
+from pydantic import BaseModel, Field
 
+from file_tool import fscompat
 from file_tool.models import (
     Action,
     MatchRule,
@@ -32,6 +34,49 @@ class RuleError(Exception):
     """规则文件无法解析或结构非法。"""
 
 
+# 下载站水印域名的后缀白名单
+# ----------------------------
+# 这份列表原先在 rules/numbering.yaml 的 5 条 preprocess 规则里各抄一遍，
+# 抄漏一个就有一条规则认不出那种域名。实测踩过的坑：G 盘的
+# ``wbrr.life@ADN-683CX.mp4`` 因为 ``.life`` 没抄进去，剥不掉域名，
+# 文件名就一直规范化不了。
+#
+# 现在规则文件里写 ``{tlds}`` 占位，加载时由这里统一注入 —— 加后缀只改这一处。
+#
+# 为什么是白名单而不是「任意后缀都行」：白名单能挡住
+# ``xxx.jpg@番号`` 这类**文件名**里的 @，避免把图片名当域名剥掉。
+WATERMARK_TLDS = (
+    "com net org xyz cc tv me info top club shop wang live site space pw "
+    "fun icu vip life ink pro store ltd biz art xxx lol monster beauty cam "
+    "sexy date faith love one global zone".split()
+)
+
+
+def _inject_tlds(raw: dict) -> dict:
+    """把 ``{tlds}`` 占位替换成实际的域名后缀列表。
+
+    规则文件里写 ``(?:{tlds})``，这里替换成 ``(?:com|net|org|...)``。
+    """
+    tlds = "|".join(WATERMARK_TLDS)
+    for section in ("preprocess", "matches"):
+        for item in raw.get(section) or []:
+            if not isinstance(item, dict):
+                continue
+            pattern = item.get("pattern")
+            if isinstance(pattern, str) and "{tlds}" in pattern:
+                item["pattern"] = pattern.replace("{tlds}", tlds)
+    return raw
+
+
+class ApplyResult(BaseModel):
+    """一次改名执行的结果明细。"""
+
+    renamed: List[Tuple[str, str]] = Field(default_factory=list)
+    """成功改名的 (原名, 新名)。"""
+    failed: List[Tuple[str, str]] = Field(default_factory=list)
+    """改失败的 (原名, 原因) —— 通常是文件被占用或无权限。"""
+
+
 def load_ruleset(path: Path) -> RuleSet:
     """从 YAML 文件加载规则集。"""
     try:
@@ -43,6 +88,8 @@ def load_ruleset(path: Path) -> RuleSet:
 
     if not isinstance(raw, dict):
         raise RuleError(f"规则文件 {path} 顶层必须是映射（mapping）")
+
+    raw = _inject_tlds(raw)
 
     # preprocess 的 capture 字段需要和 pattern 的命名分组一致
     for item in raw.get("preprocess", []) or []:
@@ -312,12 +359,22 @@ def build_plan(
     return Plan(root=str(root), items=items)
 
 
-def apply_plan(root: Path, plan: Plan) -> List[Tuple[str, str]]:
-    """执行改名，返回 (原名, 新名) 列表。
+def apply_plan(root: Path, plan: Plan) -> "ApplyResult":
+    """执行改名，返回改名与失败的明细。
 
     冲突时用「加序号」兜底：``SDMM028`` 已存在时改名为 ``SDMM028 (2)``。
+
+    三种情况必须分清，否则会改坏数据：
+
+    - **目标名已被另一个文件占用** → 加序号，绝不覆盖
+    - **目标就是源本身、只差大小写** → 两步改名（大小写不敏感的卷上
+      直接 rename 会「无事发生」）
+    - **源文件被占用 / 无权限** → 记为失败，继续处理下一个
+      （Windows 上文件被资源管理器或播放器占住是常态，macOS 上不存在）
     """
-    done: List[Tuple[str, str]] = []
+    renamed: List[Tuple[str, str]] = []
+    failed: List[Tuple[str, str]] = []
+
     for item in plan.items:
         if item.action is not Action.RENAME:
             continue
@@ -325,15 +382,25 @@ def apply_plan(root: Path, plan: Plan) -> List[Tuple[str, str]]:
         dst = root / item.target
         if not src.exists():
             continue
-        if dst.exists():
-            stem, suffix = _split_suffix(item.target)
-            counter = 2
-            while (root / f"{stem} ({counter}){suffix}").exists():
-                counter += 1
-            dst = root / f"{stem} ({counter}){suffix}"
-        src.rename(dst)
-        done.append((item.original, dst.name))
-    return done
+        try:
+            if dst.exists():
+                # 仅大小写不同 —— 是同一个文件，必须走两步改名
+                if fscompat.is_same_file(src, dst):
+                    fscompat.rename_case_only(src, dst)
+                    renamed.append((item.original, dst.name))
+                    continue
+                # 真冲突：另一个文件占了目标名，加序号兜底
+                stem, suffix = _split_suffix(item.target)
+                counter = 2
+                while (root / f"{stem} ({counter}){suffix}").exists():
+                    counter += 1
+                dst = root / f"{stem} ({counter}){suffix}"
+            src.rename(dst)
+            renamed.append((item.original, dst.name))
+        except OSError as exc:
+            failed.append((item.original, str(exc)))
+
+    return ApplyResult(renamed=renamed, failed=failed)
 
 
 def _split_suffix(name: str) -> Tuple[str, str]:

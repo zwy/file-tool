@@ -34,6 +34,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from pydantic import BaseModel, Field
 
+from file_tool import fscompat
 from file_tool.models import RuleSet
 
 # 指纹读取的字节数：首尾各读这么多，避免为几十 GB 的视频做全量哈希
@@ -140,15 +141,25 @@ def fingerprint_dir(root: Path) -> Dict[str, FileEntry]:
     """递归收集目录下所有文件的指纹，返回 {相对路径: 条目}。"""
     entries: Dict[str, FileEntry] = {}
     for path in sorted(root.rglob("*")):
-        if not path.is_file():
+        try:
+            if not path.is_file():
+                continue
+        except OSError:
             continue
         rel = path.relative_to(root)
         if _is_hidden(rel):
             continue
-        entries[str(rel)] = FileEntry(
-            relpath=str(rel),
-            size=path.stat().st_size,
-            digest=file_digest(path),
+        try:
+            size = path.stat().st_size
+            digest = file_digest(path)
+        except OSError:
+            # 被占用 / 无权限 / 名字在 Windows 上非法 —— 跳过，不让整次比对崩掉
+            continue
+        relpath = fscompat.to_posix_relpath(path, root)
+        entries[relpath] = FileEntry(
+            relpath=relpath,
+            size=size,
+            digest=digest,
         )
     return entries
 
@@ -361,13 +372,14 @@ def apply_merge_plan(
             if not other_dir.exists():
                 continue
 
-            moved, skipped = _merge_into(other_dir, primary_dir)
+            moved, skipped, failed = _merge_into(other_dir, primary_dir)
             results.append({
                 "base": group.base,
                 "dir": other,
                 "action": MergeAction.MERGE.value,
                 "moved": moved,
                 "skipped": skipped,
+                "failed": failed,
                 "reason": f"并入 {group.primary}",
             })
 
@@ -377,50 +389,75 @@ def apply_merge_plan(
     return results
 
 
-def _merge_into(src: Path, dst: Path) -> Tuple[List[str], List[str]]:
+def _merge_into(src: Path, dst: Path) -> Tuple[List[str], List[str], List[str]]:
     """把 src 下的文件并入 dst。
 
     - 目标不存在 → 移动过去
     - 目标存在且内容相同 → 删掉源文件（真重复）
     - 目标存在但内容不同 → 保留源文件，记为冲突（绝不覆盖）
+    - **文件被占用 / 无权限 → 记为失败，继续处理下一个**
 
-    返回 (已并入的文件, 被保留的冲突文件)。
+    最后一条是 Windows 上必须有的：macOS 允许删改正在打开的文件，
+    Windows 不允许 —— 资源管理器预览窗、播放器、杀毒软件都可能占着。
+    没有这条兜底，一个被占用的文件就会让整次合并抛异常中断，
+    留下「并了一半」的目录。
+
+    返回 (已并入的文件, 被保留的冲突文件, 失败的文件)。
     """
     moved: List[str] = []
     skipped: List[str] = []
+    failed: List[str] = []
 
     for path in sorted(src.rglob("*")):
-        if not path.is_file():
+        try:
+            if not path.is_file():
+                continue
+        except OSError:
             continue
         rel = path.relative_to(src)
+        rel_str = rel.as_posix()
         if _is_hidden(rel):
             # macOS 资源叉文件直接丢
-            path.unlink(missing_ok=True)
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                failed.append(rel_str)
             continue
 
         target = dst / rel
-        target.parent.mkdir(parents=True, exist_ok=True)
-
-        if not target.exists():
-            shutil.move(str(path), str(target))
-            moved.append(str(rel))
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            failed.append(rel_str)
             continue
 
-        if file_digest(target) == file_digest(path):
-            path.unlink()
-            moved.append(str(rel))
-        else:
-            skipped.append(str(rel))
+        try:
+            if not target.exists():
+                shutil.move(str(path), str(target))
+                moved.append(rel_str)
+                continue
 
-    return moved, skipped
+            if file_digest(target) == file_digest(path):
+                path.unlink()
+                moved.append(rel_str)
+            else:
+                skipped.append(rel_str)
+        except OSError:
+            failed.append(rel_str)
+
+    return moved, skipped, failed
 
 
 def _remove_if_empty(path: Path) -> None:
     """目录为空（只含空子目录）则删除，否则保留。"""
     if not path.exists():
         return
-    for sub in sorted(path.rglob("*"), reverse=True):
-        if sub.is_dir() and not any(sub.iterdir()):
-            sub.rmdir()
-    if not any(path.iterdir()):
-        shutil.rmtree(path)
+    try:
+        for sub in sorted(path.rglob("*"), reverse=True):
+            if sub.is_dir() and not any(sub.iterdir()):
+                sub.rmdir()
+        if not any(path.iterdir()):
+            shutil.rmtree(path)
+    except OSError:
+        # 有文件被占用 / 无权限 -> 目录不是空的，保留
+        pass

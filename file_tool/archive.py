@@ -32,6 +32,8 @@ from typing import Dict, List, Optional, Sequence
 
 from pydantic import BaseModel, Field
 
+from file_tool import fscompat
+
 # 已知媒体扩展名。只有这些文件参与分装，其他文件原地保留。
 MEDIA_EXTENSIONS = {
     ".mp4", ".mpg", ".mpeg", ".avi", ".wmv", ".mov", ".mkv", ".flv", ".ts",
@@ -89,6 +91,12 @@ class ArchivePlan(BaseModel):
     """不参与分装的文件（非媒体类型）。"""
     blocked: List[str] = Field(default_factory=list)
     """因目标名与现有文件冲突而无法处理的组。"""
+    unsafe: List[str] = Field(default_factory=list)
+    """在 Windows 上碰不了的文件名（原因）。
+
+    macOS 在 exFAT 上能建出带 ``:`` ``*`` ``?`` 的文件名，插到 Windows 上
+    就是僵尸文件 —— 连 ``stat`` 都会失败。这类文件不参与分装，原地保留。
+    """
 
     @property
     def merged_groups(self) -> List[ArchiveGroup]:
@@ -106,6 +114,7 @@ class ArchivePlan(BaseModel):
             "forks": len(self.forks),
             "untouched": len(self.untouched),
             "blocked": len(self.blocked),
+            "unsafe": len(self.unsafe),
         }
 
 
@@ -158,6 +167,15 @@ def build_archive_plan(
 
     buckets: Dict[str, List[str]] = {}
     for name in names:
+        # 先看名字 —— 不能用 ``root / name`` 拼路径：
+        # Windows 上 ``a:b.mp4`` 会被 pathlib 解析成「驱动器 a: + 文件 b.mp4」，
+        # 原始名就丢了，后面既认不出也搬不动。
+        reason = fscompat.is_windows_unsafe_name(name)
+        if reason:
+            plan.unsafe.append(f"{name}（{reason}）")
+            if fscompat.blocks_on_windows(name):
+                continue
+
         path = root / name
         if path.is_dir():
             continue
@@ -226,6 +244,7 @@ def apply_archive_plan(
     moved = 0
     conflicts = 0
     created_dirs = 0
+    failed: List[str] = []
 
     # ---- 先清垃圾 ----
     forks_removed = 0
@@ -243,8 +262,12 @@ def apply_archive_plan(
     for group in plan.groups:
         target_dir = root / group.name
         if not target_dir.exists():
-            target_dir.mkdir(parents=True)
-            created_dirs += 1
+            try:
+                target_dir.mkdir(parents=True)
+                created_dirs += 1
+            except OSError:
+                failed.append(group.name)
+                continue
 
         for item in group.items:
             if not item.dest:
@@ -257,8 +280,12 @@ def apply_archive_plan(
             if dst.exists():
                 conflicts += 1
                 continue
-            shutil.move(str(src), str(dst))
-            moved += 1
+            try:
+                shutil.move(str(src), str(dst))
+                moved += 1
+            except OSError:
+                # Windows 上文件被占用是常态 —— 记下来，继续处理下一个
+                failed.append(item.filename)
 
     # ---- 兜底：清掉移动过程中新产生的资源叉 ----
     # 源文件删除后，卷上可能留下孤立的 ._ 条目（无对应真实文件）
@@ -269,9 +296,11 @@ def apply_archive_plan(
         "moved": moved,
         "created_dirs": created_dirs,
         "conflicts": conflicts,
+        "failed": failed,
         "forks_removed": forks_removed,
         "groups": len(plan.groups),
         "blocked": plan.blocked,
+        "unsafe": plan.unsafe,
     }
 
 

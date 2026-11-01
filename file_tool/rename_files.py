@@ -39,6 +39,7 @@
 from __future__ import annotations
 
 import os
+import re
 from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -46,7 +47,27 @@ from typing import Dict, List, Optional
 from pydantic import BaseModel, Field
 
 from file_tool import engine
+from file_tool import fscompat
 from file_tool.models import RuleSet
+
+# 规范名里的数字段
+_CODE_DIGITS = re.compile(r"\d+")
+
+
+def canonical_code(code: str) -> str:
+    """把规范名归一成「同一作品」的比较键。
+
+    比较时必须忽略两件事：
+
+    - **大小写** —— 卷本身大小写不敏感（Windows NTFS/exFAT、macOS APFS 默认），
+      ``GVH-067`` 和 ``gvh-067`` 本来就是同一个目录。
+    - **数字段的前导零** —— 下载站给同一部番号写过 ``GVH067`` 和 ``gvh00067``，
+      数字位数不一样但值相同，是同一部片子。
+
+    实测 ``GVH-067/gvh00067.mp4`` 就是这种：目录名规范化成 ``GVH-067``，
+    文件名却是 ``gvh00067``。按字面比较会被误判成「别的番号」而跳过。
+    """
+    return _CODE_DIGITS.sub(lambda m: str(int(m.group())), code).casefold()
 
 
 class FileAction(str, Enum):
@@ -87,6 +108,12 @@ class FilePlan(BaseModel):
     """参与处理的顶层番号目录名。"""
     no_code_files: int = 0
     """文件名里没有番号、因而保持原样的文件数。"""
+    inaccessible: List[str] = Field(default_factory=list)
+    """在 Windows 上访问不了的文件（名字非法），无法改名。
+
+    macOS 在 exFAT 上能建出带 ``:`` ``*`` ``?`` 的文件名，插到 Windows 上
+    连 ``stat`` 都会失败。这类文件既不参与改名，也不该被当成「没番号」。
+    """
 
     @property
     def rename_items(self) -> List[FileItem]:
@@ -141,6 +168,46 @@ def _resolve(name: str, ruleset: RuleSet):
     return base, target, rule
 
 
+# 文件名里可作为切分点的分隔符
+_NOISE_SEPARATORS = re.compile(r"[._~@\- ]")
+
+
+def split_code_suffix(stem: str, ruleset: RuleSet):
+    """在文件名里找出「番号 + 噪声后缀」的切分。
+
+    下载站常在番号后面接一串东西，把整个文件名挡在解析之外：
+
+    ============================  ======================  ==============
+    原始文件名                      噪声                    结果
+    ============================  ======================  ==============
+    ``326FCT-043_en``             语言标记 ``_en``        ``FCT-043_en``
+    ``259LUXU-1812.mp4``          二次扩展名 ``.mp4``      ``LUXU-1812.mp4``
+    ``MKMP595-2f60f24e4602``      去重哈希 ``-2f60...``   ``MKMP-595-2f60...``
+    ``STARS-542~nyap2p.com``      站点名 ``~nyap2p.com``  ``STARS-542~nyap2p.com``
+    ============================  ======================  ==============
+
+    做法是**逐段截断试解析**：把分隔符之后的部分当成噪声后缀，
+    前缀能解析成番号就用。噪声后缀**原样保留** —— 语言标记是有意义的信息，
+    删掉就毁了。
+
+    返回 (番号基础名, 噪声后缀, 规则名)；解析不出返回 (None, "", "")。
+    """
+    base, _target, rule = _resolve(stem, ruleset)
+    if base:
+        return base, "", rule
+
+    # 切分点取在分隔符**之前**（分隔符归后缀），长的前缀优先
+    cuts = sorted({m.start() for m in _NOISE_SEPARATORS.finditer(stem)}, reverse=True)
+    for cut in cuts:
+        head, tail = stem[:cut], stem[cut:]
+        if not head:
+            continue
+        base, _target, rule = _resolve(head, ruleset)
+        if base:
+            return base, tail, rule
+    return None, "", ""
+
+
 def build_file_plan(root: Path, ruleset: RuleSet) -> FilePlan:
     """扫描 root 下所有番号目录，生成文件改名计划。"""
     plan = FilePlan(root=str(root))
@@ -157,27 +224,34 @@ def build_file_plan(root: Path, ruleset: RuleSet) -> FilePlan:
 
         for path in sorted(child.rglob("*")):
             if not path.is_file():
+                # Windows 上名字非法的文件连 stat 都会失败 —— 这里如实报告
+                if fscompat.on_windows():
+                    reason = fscompat.is_windows_unsafe_name(path.name)
+                    if reason:
+                        rel = fscompat.to_posix_relpath(path, root)
+                        plan.inaccessible.append(f"{rel}（{reason}）")
                 continue
             if path.name.startswith("._"):
                 continue  # 资源叉，交给 clean 处理
 
             stem, ext = split_extension(path.name)
-            file_base, _ftarget, _frule = _resolve(stem, ruleset)
+            file_base, noise, _frule = split_code_suffix(stem, ruleset)
 
             if not file_base:
                 plan.no_code_files += 1
                 continue
 
-            relpath = str(path.relative_to(root))
+            relpath = fscompat.to_posix_relpath(path, root)
             item = FileItem(relpath=relpath, directory=child.name, original=path.name)
 
-            if file_base != dir_base:
+            if canonical_code(file_base) != canonical_code(dir_base):
+                # 不是同一部番号 —— 判定不动
                 item.action = FileAction.SKIP
                 item.reason = f"文件名是别的番号（{file_base}），不动"
                 plan.items.append(item)
                 continue
 
-            new_name = dir_target + ext
+            new_name = dir_target + noise + ext
             if new_name == path.name:
                 item.target = new_name
                 item.action = FileAction.KEEP
@@ -185,7 +259,24 @@ def build_file_plan(root: Path, ruleset: RuleSet) -> FilePlan:
                 plan.items.append(item)
                 continue
 
-            if (path.parent / new_name).exists():
+            # 冲突检测不能用 ``Path.exists()`` ——
+            # exFAT / APFS（默认）大小写不敏感，``CLUB-880.mp4`` 和
+            # ``club-880.mp4`` 指的是**同一个文件**，exists() 恒为真。
+            # 那样每个「目录名小写、文件名大写」的目录都会被误判成冲突，
+            # 文件名就永远规范化不了。
+            #
+            # 真正的冲突是「另一个文件占了目标名」。判定靠文件身份
+            # （inode + 设备号），同一个文件只是大小写不同 -> 那是
+            # 纯大小写改名，走两步 rename，不算冲突。
+            dst_path = path.parent / new_name
+            if dst_path.exists():
+                if _is_same_file(path, dst_path):
+                    # 同一个文件，仅大小写不同 —— 不是冲突
+                    item.target = new_name
+                    item.action = FileAction.RENAME
+                    item.reason = "仅大小写不同"
+                    plan.items.append(item)
+                    continue
                 item.target = new_name
                 item.action = FileAction.CONFLICT
                 item.reason = "目标名已存在，未覆盖"
@@ -206,13 +297,16 @@ def _rename_case_only(src: Path, dst: Path) -> None:
     exFAT 与 APFS（默认）都是大小写不敏感的，``a.mp4`` -> ``A.mp4``
     直接 rename 会「无事发生」。必须先挪到临时名再改到目标名。
     """
-    tmp = src.with_name("__file_tool_tmp__")
-    counter = 0
-    while tmp.exists():
-        counter += 1
-        tmp = src.with_name(f"__file_tool_tmp__{counter}")
-    src.rename(tmp)
-    tmp.rename(dst)
+    fscompat.rename_case_only(src, dst)
+
+
+def _is_same_file(a: Path, b: Path) -> bool:
+    """两个路径是不是同一个文件（仅大小写不同）。
+
+    优先用 inode + 设备号判定；拿不到（比如某些网络卷）时退回
+    内容指纹 —— 宁可漏判成「不是同一个文件」，也不能误判成同一个。
+    """
+    return fscompat.is_same_file(a, b)
 
 
 def apply_file_plan(root: Path, plan: FilePlan) -> Dict[str, object]:

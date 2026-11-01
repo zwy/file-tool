@@ -1,14 +1,15 @@
 """file-tool CLI。
 
 常用命令：
-  file-tool rename /Volumes/P7000Z/R              # 预览改名计划（dry-run）
-  file-tool rename /Volumes/P7000Z/R --apply      # 真正执行改名
-  file-tool scan /Volumes/P7000Z/R                # 只看识别结果统计
-  file-tool rules show                            # 打印当前规则集
+  file-tool rename D:\\Media\\R              # 预览改名计划（dry-run）
+  file-tool rename D:\\Media\\R --apply      # 真正执行改名
+  file-tool scan D:\\Media\\R                # 只看识别结果统计
+  file-tool rules show                      # 打印当前规则集
 """
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -33,6 +34,22 @@ app = typer.Typer(
 )
 rules_app = typer.Typer(help="规则集管理", no_args_is_help=True)
 app.add_typer(rules_app, name="rules")
+
+
+def _force_utf8_output() -> None:
+    """把标准输出/错误流切到 UTF-8。
+
+    Windows 的控制台默认代码页是 GBK / cp437 / cp1252，中文输出会直接
+    ``UnicodeEncodeError`` 崩掉整个 CLI（英文系统上是 cp437，中文根本
+    编不出去）。这里强制 UTF-8，并对无法表示的字符降级为替代符 ——
+    宁可显示成 ``?``，也不要让工具崩在输出阶段。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            # 被重定向到不支持 reconfigure 的流 —— 忽略，不影响主流程
+            pass
 
 
 def _die(message: str) -> None:
@@ -90,19 +107,26 @@ def rename(
         _print_plan(plan)
 
     if not apply:
-        counts = plan.summary()
-        typer.secho(
-            f"\n预览模式：{counts['rename']} 个待改名 / {counts['keep']} 个已是规范名 / "
-            f"{counts['skip']} 个未匹配 / {counts['conflict']} 个冲突。"
-            f" 确认无误后加 --apply 执行。",
-            fg=typer.colors.YELLOW,
-        )
+        if not json_out:
+            counts = plan.summary()
+            typer.secho(
+                f"\n预览模式：{counts['rename']} 个待改名 / {counts['keep']} 个已是规范名 / "
+                f"{counts['skip']} 个未匹配 / {counts['conflict']} 个冲突。"
+                f" 确认无误后加 --apply 执行。",
+                fg=typer.colors.YELLOW,
+            )
         return
 
     done = engine.apply_plan(root_dir, plan)
-    typer.secho(f"已改名 {len(done)} 个目录。", fg=typer.colors.GREEN)
-    for old, new in done:
+    typer.secho(f"已改名 {len(done.renamed)} 个目录。", fg=typer.colors.GREEN)
+    for old, new in done.renamed:
         typer.echo(f"  {old}  ->  {new}")
+    if done.failed:
+        typer.secho(
+            f"失败 {len(done.failed)} 个（目录被占用或无权限）：", fg=typer.colors.RED
+        )
+        for old, reason in done.failed[:10]:
+            typer.secho(f"  {old}  —— {reason}", fg=typer.colors.RED)
 
 
 @app.command("rename-files")
@@ -130,22 +154,24 @@ def rename_files(
     if json_out:
         typer.echo(json.dumps(
             {"root": plan.root, "summary": plan.summary(),
-             "items": [i.model_dump(mode="json") for i in plan.items]},
+             "items": [i.model_dump(mode="json") for i in plan.items],
+             "inaccessible": plan.inaccessible},
             ensure_ascii=False, indent=2,
         ))
     else:
         _print_file_plan(plan)
 
     if not apply:
-        counts = plan.summary()
-        typer.secho(
-            f"\n预览模式：{counts['rename']} 个文件待改名、"
-            f"{counts['keep']} 个已是规范名、{counts['skip']} 个判定不动、"
-            f"{counts['conflict']} 个冲突。"
-            f" 另有 {counts['no_code_files']} 个文件名里没有番号，保持原样。"
-            f" 确认无误后加 --apply 执行。",
-            fg=typer.colors.YELLOW,
-        )
+        if not json_out:
+            counts = plan.summary()
+            typer.secho(
+                f"\n预览模式：{counts['rename']} 个文件待改名、"
+                f"{counts['keep']} 个已是规范名、{counts['skip']} 个判定不动、"
+                f"{counts['conflict']} 个冲突。"
+                f" 另有 {counts['no_code_files']} 个文件名里没有番号，保持原样。"
+                f" 确认无误后加 --apply 执行。",
+                fg=typer.colors.YELLOW,
+            )
         return
 
     result = rename_files_mod.apply_file_plan(root_dir, plan)
@@ -201,6 +227,14 @@ def _print_file_plan(plan) -> None:
         typer.secho("\n冲突（目标已存在，不会覆盖）：", fg=typer.colors.RED)
         for item in plan.conflict_items[:10]:
             typer.echo(f"  {item.relpath}  ->  {item.target}")
+
+    if plan.inaccessible:
+        typer.secho(
+            f"\nWindows 上无法访问，已跳过（{len(plan.inaccessible)} 个）：",
+            fg=typer.colors.YELLOW,
+        )
+        for entry in plan.inaccessible[:5]:
+            typer.echo(f"  {entry}")
 
 
 @app.command()
@@ -268,13 +302,14 @@ def merge(
         _print_merge_plan(plan)
 
     if not apply:
-        counts = plan.summary()
-        typer.secho(
-            f"\n预览模式：{counts['duplicate']} 组内容完全一致（可合并）、"
-            f"{counts['partial']} 组部分重叠、{counts['different']} 组内容不同（不合并）。"
-            f" 确认无误后加 --apply 执行。",
-            fg=typer.colors.YELLOW,
-        )
+        if not json_out:
+            counts = plan.summary()
+            typer.secho(
+                f"\n预览模式：{counts['duplicate']} 组内容完全一致（可合并）、"
+                f"{counts['partial']} 组部分重叠、{counts['different']} 组内容不同（不合并）。"
+                f" 确认无误后加 --apply 执行。",
+                fg=typer.colors.YELLOW,
+            )
         return
 
     results = merge_mod.apply_merge_plan(
@@ -283,6 +318,7 @@ def merge(
     merged = [r for r in results if r["action"] == MergeAction.MERGE.value]
     kept = [r for r in results if r["action"] == MergeAction.KEEP.value]
     skipped = [r for r in results if r["action"] == MergeAction.SKIP.value]
+    failed_total = sum(len(r.get("failed", [])) for r in results)
     typer.secho(
         f"合并完成：{len(merged)} 个副本目录已并入，"
         f"{len(kept)} 个主目录保留，{len(skipped)} 个未处理。",
@@ -294,6 +330,18 @@ def merge(
             typer.secho(
                 f"      冲突保留 {len(r['skipped'])} 个同名不同内容文件", fg=typer.colors.YELLOW
             )
+        if r.get("failed"):
+            typer.secho(
+                f"      失败 {len(r['failed'])} 个（被占用或无权限，原地保留）："
+                f"{', '.join(r['failed'][:3])}",
+                fg=typer.colors.RED,
+            )
+    if failed_total:
+        typer.secho(
+            f"共 {failed_total} 个文件未能并入 —— 通常是被其他程序占用"
+            "（资源管理器预览窗、播放器）。关掉占用者后重跑即可。",
+            fg=typer.colors.YELLOW,
+        )
 
 
 def _print_merge_plan(plan) -> None:
@@ -351,21 +399,22 @@ def archive(
             {"root": plan.root, "summary": plan.summary(),
              "groups": [g.model_dump(mode="json") for g in plan.groups],
              "forks": plan.forks, "untouched": plan.untouched,
-             "blocked": plan.blocked},
+             "blocked": plan.blocked, "unsafe": plan.unsafe},
             ensure_ascii=False, indent=2,
         ))
     else:
         _print_archive_plan(plan)
 
     if not apply:
-        counts = plan.summary()
-        typer.secho(
-            f"\n预览模式：将建 {counts['groups']} 个目录、分装 {counts['files']} 个文件"
-            f"（其中 {counts['merged_groups']} 组由多个变体归一而来）、"
-            f"清理 {counts['forks']} 个 ._ 垃圾文件。"
-            f" 确认无误后加 --apply 执行。",
-            fg=typer.colors.YELLOW,
-        )
+        if not json_out:
+            counts = plan.summary()
+            typer.secho(
+                f"\n预览模式：将建 {counts['groups']} 个目录、分装 {counts['files']} 个文件"
+                f"（其中 {counts['merged_groups']} 组由多个变体归一而来）、"
+                f"清理 {counts['forks']} 个 ._ 垃圾文件。"
+                f" 确认无误后加 --apply 执行。",
+                fg=typer.colors.YELLOW,
+            )
         return
 
     result = archive_mod.apply_archive_plan(
@@ -380,6 +429,18 @@ def archive(
     if result["conflicts"]:
         typer.secho(
             f"注意：{result['conflicts']} 个文件因目标已存在同名文件而未移动（未覆盖）。",
+            fg=typer.colors.YELLOW,
+        )
+    if result.get("failed"):
+        typer.secho(
+            f"注意：{len(result['failed'])} 个文件未能移动（被占用或无权限）："
+            f"{', '.join(result['failed'][:5])}",
+            fg=typer.colors.YELLOW,
+        )
+    if result.get("unsafe"):
+        typer.secho(
+            f"注意：{len(result['unsafe'])} 个文件在 Windows 上无法访问，"
+            "已原地保留（多半是 macOS 在 exFAT 上建的名字）。",
             fg=typer.colors.YELLOW,
         )
     if result["blocked"]:
@@ -431,6 +492,12 @@ def _print_archive_plan(plan) -> None:
             f"无法处理（目录名与现有文件冲突）：{', '.join(plan.blocked)}",
             fg=typer.colors.RED,
         )
+    if plan.unsafe:
+        typer.secho(
+            f"Windows 上无法访问，原地保留（{len(plan.unsafe)} 个）："
+            f"{', '.join(plan.unsafe[:3])}",
+            fg=typer.colors.YELLOW,
+        )
 
 
 @app.command()
@@ -442,9 +509,12 @@ def tidy(
         False, "--include-partial", help="同时处理部分重叠的组"
     ),
     isolate: Optional[str] = typer.Option(
-        None, "--isolate", help="把不符合番号规范的目录挪到这里（如 /Volumes/P7000Z/GC）"
+        None, "--isolate", help="把不符合番号规范的目录挪到这里（如 D:\\Media\\GC）"
     ),
     keep_forks: bool = typer.Option(False, "--keep-forks", help="保留 ._ 资源叉垃圾文件"),
+    no_file_rename: bool = typer.Option(
+        False, "--no-file-rename", help="只改目录名，不改文件名里的番号"
+    ),
     json_out: bool = typer.Option(False, "--json", help="以 JSON 输出计划"),
 ) -> None:
     """智能整理一个目录：自动判断形态并编排动作。
@@ -452,11 +522,11 @@ def tidy(
     自动识别目录形态并决定做什么：
 
     - flat   （平铺文件）      → 分装进番号目录
-    - nested （子目录是番号）  → 规范化目录名 + 合并重复目录
+    - nested （子目录是番号）  → 规范化目录名 + 合并重复目录 + 规范化文件名
     - mixed  （两者都有）      → 先分装再规范化
     - loose  （子目录不像番号）→ 只报告，不动
 
-    执行顺序固定为 clean → isolate → merge → archive → rename。
+    执行顺序固定为 clean → isolate → merge → archive → rename → rename-files。
     """
     root_dir = _resolve_root(root)
     ruleset = _load_rules(rules)
@@ -464,7 +534,10 @@ def tidy(
     if isolate_to is not None and isolate_to.exists() and not isolate_to.is_dir():
         _die(f"隔离目标不是目录：{isolate_to}")
     try:
-        plan = tidy_mod.build_tidy_plan(root_dir, ruleset, isolate_to=isolate_to)
+        plan = tidy_mod.build_tidy_plan(
+            root_dir, ruleset, isolate_to=isolate_to,
+            rename_file_names=not no_file_rename,
+        )
     except ValueError as exc:
         _die(str(exc))
 
@@ -480,11 +553,12 @@ def tidy(
         _print_tidy_plan(plan)
 
     if not apply:
-        typer.secho(
-            f"\n预览模式：识别为 {plan.shape.value} 形态，"
-            f"计划 {plan.total_actions} 个动作。确认无误后加 --apply 执行。",
-            fg=typer.colors.YELLOW,
-        )
+        if not json_out:
+            typer.secho(
+                f"\n预览模式：识别为 {plan.shape.value} 形态，"
+                f"计划 {plan.total_actions} 个动作。确认无误后加 --apply 执行。",
+                fg=typer.colors.YELLOW,
+            )
         return
 
     result = tidy_mod.apply_tidy_plan(
@@ -498,12 +572,18 @@ def tidy(
         f"合并 {result['merged']} 个重复目录，"
         f"分装 {result['archived']} 个文件，"
         f"改名 {result['renamed']} 个目录，"
+        f"规范化 {result['renamed_files']} 个文件名，"
         f"清理 {result['forks_removed']} 个垃圾文件。",
         fg=typer.colors.GREEN,
     )
     if result["conflicts"]:
         typer.secho(
             f"注意：{result['conflicts']} 项因目标已存在而未处理（未覆盖）。",
+            fg=typer.colors.YELLOW,
+        )
+    if result.get("failed"):
+        typer.secho(
+            f"注意：{result['failed']} 项因被占用或无权限而失败，原地保留。",
             fg=typer.colors.YELLOW,
         )
 
@@ -524,6 +604,7 @@ def _print_tidy_plan(plan) -> None:
         StepKind.MERGE: "合并",
         StepKind.ARCHIVE: "分装",
         StepKind.RENAME: "改名",
+        StepKind.RENAME_FILES: "改文件名",
     }
     for step in plan.steps:
         typer.secho(
@@ -544,7 +625,7 @@ def _print_tidy_plan(plan) -> None:
 @app.command()
 def isolate(
     root: str = typer.Argument(..., help="要整理的目录"),
-    target: str = typer.Option(..., "--to", help="把不符合的目录挪到这里（如 /Volumes/P7000Z/GC）"),
+    target: str = typer.Option(..., "--to", help="把不符合的目录挪到这里（如 D:\\Media\\GC）"),
     apply: bool = typer.Option(False, "--apply", help="真正执行（默认只预览）"),
     rules: Optional[Path] = typer.Option(None, "--rules", help="规则文件路径"),
     keep_empty: bool = typer.Option(False, "--keep-empty", help="空目录不挪走"),
@@ -570,19 +651,20 @@ def isolate(
         typer.echo(json.dumps(
             {"root": plan.root, "target": plan.target, "summary": plan.summary(),
              "items": [i.model_dump(mode="json") for i in plan.items],
-             "conflicts": plan.conflicts},
+             "conflicts": plan.conflicts, "unsafe": plan.unsafe},
             ensure_ascii=False, indent=2,
         ))
     else:
         _print_isolation_plan(plan)
 
     if not apply:
-        counts = plan.summary()
-        typer.secho(
-            f"\n预览模式：{counts['move']} 个目录将挪到 {target_dir}，"
-            f"{counts['keep']} 个保留。确认无误后加 --apply 执行。",
-            fg=typer.colors.YELLOW,
-        )
+        if not json_out:
+            counts = plan.summary()
+            typer.secho(
+                f"\n预览模式：{counts['move']} 个目录将挪到 {target_dir}，"
+                f"{counts['keep']} 个保留。确认无误后加 --apply 执行。",
+                fg=typer.colors.YELLOW,
+            )
         return
 
     result = isolate_mod.apply_isolation_plan(root_dir, target_dir, plan)
@@ -597,6 +679,11 @@ def isolate(
         typer.secho(f"  （目标已存在同名目录）{note}", fg=typer.colors.YELLOW)
     if result["failed"]:
         typer.secho(f"失败 {len(result['failed'])} 个：{result['failed']}", fg=typer.colors.RED)
+    if plan.unsafe:
+        typer.secho(
+            f"另有 {len(plan.unsafe)} 个目录在 Windows 上挪不动，已原地保留。",
+            fg=typer.colors.YELLOW,
+        )
 
 
 def _print_isolation_plan(plan) -> None:
@@ -628,6 +715,12 @@ def _print_isolation_plan(plan) -> None:
             f"{', '.join(plan.conflicts)}",
             fg=typer.colors.YELLOW,
         )
+    if plan.unsafe:
+        typer.secho(
+            f"\nWindows 上挪不动，原地保留（{len(plan.unsafe)} 个）："
+            f"{', '.join(plan.unsafe[:3])}",
+            fg=typer.colors.YELLOW,
+        )
 
 
 @app.command()
@@ -637,10 +730,10 @@ def clean(
     no_recursive: bool = typer.Option(False, "--no-recursive", help="只清理顶层，不递归"),
     json_out: bool = typer.Option(False, "--json", help="以 JSON 输出计划"),
 ) -> None:
-    """递归清理 macOS 资源叉垃圾（``._xxx`` / ``.DS_Store``）。
+    """递归清理资源叉垃圾（``._xxx`` / ``.DS_Store`` / ``Thumbs.db``）。
 
-    这些是 exFAT 等非 HFS+ 卷上的元数据副本，对媒体文件没有价值。
-    只删资源叉，真实文件和目录一律不动。
+    这些是 macOS / Windows 在 exFAT 等非 HFS+ 卷上留下的元数据副本，
+    对媒体文件没有价值。只删垃圾，真实文件和目录一律不动。
     """
     root_dir = _resolve_root(root)
     plan = clean_mod.build_clean_plan(root_dir, recursive=not no_recursive)
@@ -665,11 +758,12 @@ def clean(
             typer.echo(f"  … 另有 {len(plan.items) - 10} 个")
 
     if not apply:
-        typer.secho(
-            f"\n预览模式：将清理 {plan.summary()['forks']} 个资源叉垃圾。"
-            f" 确认无误后加 --apply 执行。",
-            fg=typer.colors.YELLOW,
-        )
+        if not json_out:
+            typer.secho(
+                f"\n预览模式：将清理 {plan.summary()['forks']} 个资源叉垃圾。"
+                f" 确认无误后加 --apply 执行。",
+                fg=typer.colors.YELLOW,
+            )
         return
 
     result = clean_mod.apply_clean_plan(plan)
@@ -719,6 +813,7 @@ def _print_plan(plan) -> None:
 
 
 def main() -> None:
+    _force_utf8_output()
     app()
 
 

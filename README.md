@@ -28,16 +28,49 @@
 
 ## 环境
 
+需要 Python 3.11+。
+
 ```bash
-cd /Users/zwy/Sites/file-tool
-source .venv/bin/activate      # Python 3.12.8，与兄弟项目 charvar 一致
+# macOS / Linux
+cd /path/to/file-tool
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"
+```
+
+```powershell
+# Windows
+cd D:\path\to\file-tool
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -e ".[dev]"
 ```
 
 依赖：`typer`（CLI）、`pydantic`（规则校验）、`PyYAML`（规则文件）。开发依赖 `pytest`。
 
+### 装成全局命令
+
+两个脚本都做同一件事：生成一个指向仓库内 `.venv` 的 launcher，
+**仓库改了不用重装**。
+
+```bash
+./scripts/install_cli.sh                      # macOS / Linux -> ~/.local/bin/file-tool
+./scripts/install_cli.sh --add-to-path        # 并写进 PATH
+```
+
+```powershell
+# Windows -> %LOCALAPPDATA%\file-tool\bin\file-tool.cmd
+powershell -ExecutionPolicy Bypass -File scripts\install_cli.ps1
+powershell -ExecutionPolicy Bypass -File scripts\install_cli.ps1 -AddToPath
+```
+
+> Windows 上 `.ps1` 必须存成 **UTF-8 with BOM**。PowerShell 5.1 没有 BOM 就按
+> ANSI 代码页读，脚本里的中文会把语法搞乱（报「意外的标记」）。VS Code 右下角
+> 选 `UTF-8 with BOM` 即可。
+
 ## 命令
 
 ```bash
+# 路径按自己的平台换：macOS /Volumes/P7000Z/R，Windows D:\Media\R
 file-tool tidy    /Volumes/P7000Z/R      # 智能整理（自动判断该做什么）
 file-tool tidy    /Volumes/P7000Z/R --apply
 
@@ -58,14 +91,79 @@ file-tool clean   /Volumes/P7000Z/IMG --apply
 file-tool rules  show                         # 查看当前规则集
 ```
 
-所有命令默认只预览，加 `--apply` 才落盘。加 `--json` 输出机器可读的计划。
+Windows 上路径带盘符，含空格要加引号：
+
+```powershell
+file-tool tidy "D:\Media\R"
+file-tool isolate "D:\Media\R" --to "D:\Media\GC"
+```
+
+所有命令默认只预览，加 `--apply` 才落盘。加 `--json` 输出机器可读的计划
+（stdout 上**只有** JSON，可以直接喂给 `jq` 或 `json.loads`）。
 
 未安装时可用模块方式运行：`python -m file_tool.cli <命令>`。
+
+> PowerShell 的 `>` 重定向会写 UTF-8 **带 BOM**，下游 `json.loads` 会报
+> `Unexpected UTF-8 BOM`。要纯 JSON 就用 `| Out-File -Encoding utf8NoBOM`，
+> 或者直接让 Python 读管道。工具本身输出的字节是干净的 UTF-8，无 BOM。
+
+## 平台差异（Windows / macOS）
+
+工具在两个平台上都能跑，但文件系统规则不同 —— 差异都收在
+`file_tool/fscompat.py` 一处，下面是用户能看到的差异。
+
+### 文件名规则
+
+Windows 有一批 macOS 不允许的名字：**保留设备名**（`CON` `NUL` `COM1`，
+带扩展名也一样）、**非法字符**（`< > : " / \ | ? *`）、**结尾的点和空格**
+（会被静默剥掉）。
+
+exFAT 卷在 macOS 上能建出带 `:` 的文件名，插到 Windows 上就成了碰不了的
+僵尸文件 —— 连 `stat` 都会失败。工具在扫描时会识别这类名字：
+
+- **Windows 上**：不碰它，如实报告（`archive` / `isolate` / `rename-files`
+  的计划里会单列出来）
+- **macOS 上**：名字完全合法，照常处理（`rename-files` 反而能顺手把它改好）
+
+### 大小写
+
+Windows NTFS/exFAT 与 macOS APFS（默认）都**大小写不敏感**。仅大小写不同的
+改名走两步（先挪临时名再改目标名），否则 rename 会「无事发生」。
+
+### 文件占用
+
+macOS 允许删改正在打开的文件，Windows 不允许。资源管理器预览窗、播放器、
+杀毒软件都可能占着文件。工具的做法是**跳过这个文件、记成失败、继续处理下一个**，
+而不是让整次操作抛异常中断，留下「并了一半」的目录。
+
+```powershell
+file-tool merge D:\Media\R --apply
+# ...
+#   共 3 个文件未能并入 —— 通常是被其他程序占用（资源管理器预览窗、播放器）。
+#   关掉占用者后重跑即可。
+```
+
+### 控制台编码
+
+Windows 控制台默认代码页是 GBK / cp437 / cp1252，中文输出会直接
+`UnicodeEncodeError` 崩掉整个 CLI。工具启动时会把 stdout/stderr 切到 UTF-8，
+所以在任何代码页下都能正常输出中文。
+
+### 路径分隔符
+
+JSON 输出和 CLI 里的**相对路径统一用 `/`**（`ACHJ-038/子目录/x.mp4`），
+不随平台变。下游脚本可以跨平台复用。
+
+### 长度限制
+
+Windows 的 `MAX_PATH` 是 260 字符。Python 本身是长路径感知的，能绕过，
+但资源管理器和很多播放器不行。深层目录（番号目录往下 3~5 层）配长中文名时
+要注意。
 
 ## clean：递归清理资源叉垃圾
 
 macOS 在 exFAT 等非 HFS+ 卷上，为每个文件建一个 `._xxx` 资源叉副本。
-媒体文件不需要这些元数据，它们是纯粹的垃圾。
+Windows 在同样的卷上会留 `Thumbs.db`。媒体文件不需要这些元数据，它们是纯粹的垃圾。
 
 实测 `/Volumes/P7000Z/IMG` 嵌套层有 **24000 多个**，`R` 有 7000 多个。
 
@@ -149,7 +247,7 @@ file-tool isolate /Volumes/P7000Z/R --to /Volumes/P7000Z/GC --apply
 ### 动作编排顺序
 
 ```
-clean → isolate → merge → archive → rename
+clean → isolate → merge → archive → rename → rename-files
 ```
 
 **isolate 排在最前**：先把不符合规范的目录挪走，剩下的才都是干净的番号目录。
@@ -158,6 +256,13 @@ clean → isolate → merge → archive → rename
 反过来先改名，合并要在改名后的名字里重新识别重复标记，多一道解析。
 
 **archive 与 rename 有先后依赖**：先把平铺文件装进目录，才谈得上给它们改名。
+
+**rename-files 必须排在 rename 之后**：文件名的目标来自**所在目录的规范名**，
+目录名先规范化，文件才有正确的目标可对。
+
+> 早期版本 `tidy` 只改目录名，文件名里的番号要另外跑 `rename-files` ——
+> 「一个命令搞定」的说法站不住。现在这一步已经并进 `tidy`。
+> 不想动文件名就加 `--no-file-rename`。
 
 ### 为什么只看顶层，不递归
 
@@ -254,6 +359,48 @@ BDSR-436/BDSR436.mp4               ->  BDSR-436.mp4
 判定「是不是同一个作品」用**基础名**（不含重复副本标记）比对：
 文件名解析出的基础名 == 所在目录的基础名 → 规范化；不等 → 判定不动并报告
 （`STSK-108/aavv38.xyz@STSK108A.mp4` 是另一个作品，不动）。
+
+比对时忽略两件事：**大小写**和**数字段的前导零**。
+下载站给同一部片子写过 `GVH067` 和 `gvh00067` —— 卷本身大小写不敏感
+（Windows / macOS APFS 默认），数字位数不同但值相同，是同一部番号。
+按字面比较会把它误判成「别的番号」而跳过。
+
+### 番号后面带噪声后缀
+
+下载站常在番号后面接一串东西，把整个文件名挡在解析之外：
+
+| 原始文件名 | 噪声 | 结果 |
+|---|---|---|
+| `326FCT-043_en.srt` | 语言标记 `_en` | `FCT-043_en.srt` |
+| `259LUXU-1812.mp4.jpg` | 二次扩展名 `.mp4` | `LUXU-1812.mp4.jpg` |
+| `MKMP595-2f60f24e4602.mp4` | 去重哈希 | `MKMP-595-2f60f24e4602.mp4` |
+| `STARS-542~nyap2p.com.mp4` | 站点名 | `STARS-542~nyap2p.com.mp4` |
+
+做法是**逐段截断试解析**：把分隔符之后的部分当成噪声后缀，前缀能解析成
+番号就用。噪声后缀**原样保留** —— 语言标记是有意义的信息，删掉就毁了。
+
+实测一个 640 文件的库：这一项加上去之后，带水印域名的文件名从 350 个
+降到 3 个（2 个是站点名残留、1 个是垃圾 `.url.txt`，都不是番号）。
+
+### 大小写不敏感的卷上，冲突检测不能用 exists()
+
+这是最容易踩、也最不容易看出来的一类 bug —— **它不报错，只是静默不生效**。
+
+exFAT / APFS（默认）/ NTFS 都是大小写不敏感的：
+`CLUB-880.mp4` 和 `club-880.mp4` 指的是**同一个文件**，
+所以 `Path.exists()` 对两者都返回 True。
+
+实测 G 盘踩到的坑：目录名是 `club-880`（小写），文件名是 `CLUB-880.mp4`（大写）。
+目录名规范化后文件的目标名是 `club-880.mp4`，而 `exists()` 判定「已存在」恒为真 ——
+明明是同一个文件，却被判成**冲突**，于是文件名永远规范化不了。
+（G 盘有 6 个这样的目录，全部卡住。）
+
+正确判定靠**文件身份**（inode + 设备号，`os.path.samefile`），
+不是路径字符串。真正的冲突是「另一个文件占了目标名」——
+哪怕两个文件只差大小写、内容不同，那仍然是冲突，绝不覆盖。
+
+同理，**验证改名结果也不能靠 `exists()`** ——
+大小写不敏感卷上旧名和新名是同一个路径，要看 `iterdir()` 的列表。
 
 ### 安全语义
 
@@ -384,6 +531,56 @@ exclude:
 
 排除是「整类形态」的判断，必须写在规则文件里而不是代码里 ——
 哪个前缀属于国产是领域知识，会随资料来源变化。
+
+### 下载站的各种包装形态
+
+番号目录名从不同下载站出来长得五花八门，规则文件里逐个对应着：
+
+| 原名 | 规范名 | 靠哪条规则 |
+|---|---|---|
+| `kfa55.com@SDMM028C` | `SDMM-028C` | `strip_watermark_domain`（前缀域名） |
+| `SDMM128Caavv38.xyz@` | `SDMM-128C` | `strip_trailing_domain`（**尾部**域名） |
+| `htbet166.com-OKK007C` | `OKK-007C` | `strip_dash_domain`（横杠分隔） |
+| `madoubt.com 853252.xyz DOKS-657` | `DOKS-657` | `strip_space_domains`（空格分隔多个域名） |
+| `dxxdom.comSONE815` | `SONE-815` | `strip_joined_domain`（域名与番号**直接相连**） |
+| `STARS-542.HD` | `STARS-542` | `strip_quality_suffix`（画质后缀） |
+| `ABF-292-AI` | `ABF-292-AI` | `studio_dash_num_dash_ver` |
+| `230ORECO894C` | `ORECO-894C` | `prefix_num_studio_nodash`（数字前缀，**无横杠**） |
+| `KIN8-4069` | `KIN8-4069` | `upper_dash_digit_studio`（大写厂牌含数字） |
+| `kin8-3980` | `kin8-3980` | `lower_dash_digit_studio`（厂牌含数字） |
+| `sgm00030` | `sgm-00030` | `lower_code_short_studio`（3 位小写厂牌） |
+
+尾部域名那条有个坑值得记：番号段是大写字母+数字，域名段是小写，
+**靠大小写把两段分开**。写成 `^(?P<code>.+?)(?P<domain>...)@$` 是不行的 ——
+番号段用惰性匹配会只吃到 1 个字符，而域名段的字符类又允许大写，
+结果整串被当成域名剥光（`SDMM128Caavv38.xyz@` → 空串）。
+
+**域名后缀白名单只有一处。** 规则文件里写 `{tlds}` 占位，
+实际列表在 `file_tool/engine.py` 的 `WATERMARK_TLDS` ——
+以前这份列表在 5 条规则里各抄一遍，抄漏一个就有一条规则认不出那种域名。
+实测踩过：`wbrr.life@ADN-683CX.mp4` 因为 `.life` 没抄进去，剥不掉域名，
+文件名就一直规范化不了。**加后缀只改 `engine.py` 一处。**
+
+**加新规则后必须全库跑一遍预览，确认破坏数为 0** ——
+新规则可能抢在旧规则前面匹配，把已经规范的目录改坏。
+`tests/` 里有幂等性测试兜底，但真库验证还是要自己跑。
+
+### 导出名不是番号
+
+判定「目录里有没有番号」用的是宽松正则，但**相机/手机的原始导出名**
+长得像番号却不是番号：
+
+```
+IMG_6481.jpg     photo_2023.jpg     dw9358.jpg     P1000123.jpg
+```
+
+这些是导出工具的默认文件名（`IMG` / `DSC` / `DJI` / `photo` / `dw`…），
+不是厂牌名。实测国产合集目录 `322` 里全是这类文件，宽松正则会把它们
+认成番号 —— 结果整个国产合集被判成「含番号」而留在番号库里，
+**国产内容就这么混进了番号库**。
+
+所以 `isolate` 会排除已知导出前缀（见 `file_tool/isolate.py` 的
+`_EXPORT_NAME_PREFIXES`）。真实的番号厂牌不会撞上这些前缀。
 
 **名单是实测出来的，不是猜的。** 判定依据是**目录里有没有番号文件**：
 
@@ -529,6 +726,11 @@ R 剩下的 238 个目录里，唯一两个「未匹配」的是 `Uncensored Lea
 - rename-files 只改文件名里已有番号的文件，其余保持原样
 - rename-files 的扩展名原样保留，不做白名单
 - 规则文件里的正则会在加载时校验，非法正则直接报错而不是运行期才炸
+- **文件被占用 / 无权限**：跳过这个文件、记成失败、继续处理下一个，
+  不让整次操作中断在「并了一半」的目录上
+- **Windows 非法文件名**（保留设备名、`:` 等非法字符、结尾的点/空格）：
+  Windows 上不碰它并如实报告；macOS 上照常处理
+- `--json` 模式下 stdout 上只有 JSON，不掺人看的提示
 
 ## 测试
 
@@ -536,7 +738,7 @@ R 剩下的 238 个目录里，唯一两个「未匹配」的是 `Uncensored Lea
 python -m pytest -q
 ```
 
-141 个测试，覆盖改名规则、重复标记回贴、冲突检测，merge 的三种判定与执行语义，
+266 个测试，覆盖改名规则、重复标记回贴、冲突检测，merge 的三种判定与执行语义，
 archive 的归一逻辑与资源叉清理（含先清后移的回归测试），
 isolate 的内容判定与嵌套保护，tidy 的四种形态识别与动作编排顺序，
 以及规范名的幂等性、国产编号的排除（FLUP / 日期型 / MON / xfxfz）、
@@ -544,6 +746,22 @@ isolate 的内容判定与嵌套保护，tidy 的四种形态识别与动作编�
 
 其中「条件剥离不得覆盖正确基准」这条用的是**合成规则集**而不是具体厂牌 ——
 它测的是引擎行为，所以将来加新规则也不会失效。
+
+Windows 专属的行为也有单独一组测试（`tests/test_fscompat.py`、
+`tests/test_windows_semantics.py`）：保留设备名与非法字符的识别、
+大小写两步改名、相对路径统一用 `/`、文件被占用时跳过而不中断、
+`--json` 输出必须是合法 JSON。
+
+双平台一致性由 `tests/test_platform_parity.py` 守住：平台差异**只**体现在
+`fscompat.blocks_on_windows()` 这一个闸门上，闸门之外的核心逻辑两边完全一致。
+其中 3 个测试是 POSIX 专属的（Windows 建不出 `a:b.mp4` 这种名字），
+在 Windows 上跳过，由 CI 的 macOS runner 执行。
+
+`tests/test_g_drive_forms.py` 锁住第二块外置盘（G 盘）实测出的形态 ——
+数字前缀无横杠、大写厂牌含数字、域名与番号直接相连，
+以及「相机导出名不是番号」和「正规番号不能被 isolate 误隔离」。
+
+CI 矩阵覆盖 Linux / macOS / Windows 三个平台 × Python 3.11 / 3.12 / 3.13。
 
 ## 当前识别情况（/Volumes/P7000Z/R，238 个子目录）
 

@@ -44,6 +44,7 @@ from typing import Dict, List, Optional, Sequence
 from pydantic import BaseModel, Field
 
 from file_tool import engine
+from file_tool import fscompat
 from file_tool.models import RuleSet
 
 # 番号形态：厂牌字母 + 数字（可带横杠），如 ABP-001、AV-20608、SDMM028C
@@ -52,6 +53,40 @@ CODE_IN_NAME = re.compile(
     r"[A-Za-z]{2,6}[-_]?\d{3,6}"  # 厂牌 + 序号
     r"(?![A-Za-z0-9])"           # 右边不是字母数字
 )
+
+# 相机 / 手机 / 相册软件的原始导出名 —— 它们长得像番号，但不是番号。
+#
+# 实测踩过的坑：国产合集目录 ``322`` 里全是 ``IMG_6481.jpg`` /
+# ``photo_2023.jpg`` / ``dw9358.jpg`` 这类文件名，宽松的番号正则会把它们
+# 认成番号，导致整个国产合集被判定为「含番号」而留在番号库里 ——
+# 国产内容就这么混进了番号库。
+#
+# 这些前缀都是**导出工具的名字**，不是厂牌：厂牌名不会叫 IMG / DSC / DJI。
+# 所以把它们排除掉是安全的 —— 真实番号不会用这些前缀。
+_EXPORT_NAME_PREFIXES = (
+    "img", "dsc", "dj", "dji", "gopr", "mvhd", "p1000", "p_", "vid", "mov",
+    "mvi", "photo", "image", "picture", "pic", "video", "screenshot",
+    "screen", "wechat", "weixin", "whatsapp", "signal", "telegram",
+    "snap", "pxl", "dcim", "vlog", "movie",
+    # 厂牌段只有 2 个字母的导出名 —— 正则的厂牌段下限就是 2，
+    # 所以 dw 这类必须单独列出来。
+    "dw",
+)
+
+
+def _is_export_name(token: str) -> bool:
+    """这个 token 是不是原始导出名（相机/手机导出的默认文件名）。
+
+    只看**厂牌段**（数字前的字母部分）：``IMG_6481`` 的厂牌段是 ``IMG``，
+    ``dw9358`` 的厂牌段是 ``dw``，都命中导出工具前缀表。
+
+    真实的番号厂牌（ABP / SDMM / MAAN / KIN8…）不会撞上这些前缀。
+    """
+    m = re.match(r"^[A-Za-z]{2,6}", token)
+    if not m:
+        return False
+    return m.group(0).lower() in _EXPORT_NAME_PREFIXES
+
 
 
 class Isolation(str, Enum):
@@ -84,6 +119,12 @@ class IsolationPlan(BaseModel):
     items: List[IsolationItem] = Field(default_factory=list)
     conflicts: List[str] = Field(default_factory=list)
     """目标目录里已存在同名目录，挪动时会加序号。"""
+    unsafe: List[str] = Field(default_factory=list)
+    """在 Windows 上挪不动的目录名（名字非法），原地保留。
+
+    macOS 在 exFAT 上能建出带 ``:`` ``*`` ``?`` 的目录名，插到 Windows 上
+    连目标路径都拼不出来。这类目录不参与隔离，只如实报告。
+    """
 
     @property
     def move_items(self) -> List[IsolationItem]:
@@ -106,6 +147,9 @@ def find_codes_in_dir(directory: Path, limit: int = 5) -> List[str]:
 
     只看**文件名**和**目录名**，不看文件内容 —— 内容扫描代价太高，
     而番号几乎总是出现在文件名里。
+
+    原始导出名（``IMG_6481`` / ``photo_2023``）会被排除 ——
+    它们长得像番号但不是番号，见 :func:`_is_export_name`。
     """
     found: List[str] = []
     seen = set()
@@ -116,11 +160,14 @@ def find_codes_in_dir(directory: Path, limit: int = 5) -> List[str]:
         for text in (path.name,):
             for match in CODE_IN_NAME.finditer(text):
                 code = match.group(0)
-                if code not in seen:
-                    seen.add(code)
-                    found.append(code)
-                    if len(found) >= limit:
-                        return found
+                if code in seen:
+                    continue
+                if _is_export_name(code):
+                    continue
+                seen.add(code)
+                found.append(code)
+                if len(found) >= limit:
+                    return found
     return found
 
 
@@ -194,8 +241,19 @@ def build_isolation_plan(
     if names is None:
         names = sorted(p.name for p in root.iterdir())
 
-    dirs = [n for n in names if (root / n).is_dir()]
     plan = IsolationPlan(root=str(root), target=str(target))
+
+    # 先按原始名筛 —— Windows 上 ``a:b`` 这类名字用 ``root / n`` 拼出来的
+    # 路径是错的（pathlib 会把 ``a:`` 当成驱动器），必须先挑出来。
+    dirs = []
+    for n in names:
+        reason = fscompat.is_windows_unsafe_name(n)
+        if reason:
+            plan.unsafe.append(f"{n}（{reason}）")
+            if fscompat.blocks_on_windows(n):
+                continue
+        if (root / n).is_dir():
+            dirs.append(n)
 
     # 目标目录本身不能被挪进自己
     target_resolved = target.resolve() if target.exists() else target.absolute()
