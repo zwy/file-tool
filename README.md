@@ -948,6 +948,11 @@ Windows 上还额外跑一遍**目录级大小写敏感**的目录（NTFS 特性
 把 Linux / macOS 的卷语义搬到 Windows runner 上验 —— 不用额外 runner
 就能守住上面那一类 bug。
 
+`tests/conftest.py` 会把失败的测试写成 **GitHub Actions 注释**（只在 CI 里生效）。
+GitHub 自带的 pytest problem matcher 认不出 `FAILED tests/test_x.py::test_y`
+这种带 `::` 的格式，不加这个的话 CI 页面上只有一句
+「Process completed with exit code 1」，得翻日志才知道是哪个测试挂了。
+
 ## 当前识别情况（/Volumes/P7000Z/R，238 个子目录）
 
 | 规则 | 命中数 | 示例 |

@@ -16,6 +16,13 @@ from file_tool.models import Action, Plan, PlanItem
 
 RULES = Path(__file__).resolve().parent.parent / "rules" / "numbering.yaml"
 
+# Windows / NTFS 建不出带 ``:`` 的文件名（连 stat 都会失败），
+# 只有 POSIX 能真实验证「目录遍历拿到的原始名没被吃掉」
+POSIX_ONLY = pytest.mark.skipif(
+    os.name == "nt",
+    reason="Windows/NTFS 建不出非法文件名，只有 POSIX 能真实验证",
+)
+
 
 # --------------------------------------------------------------------------
 # Windows 文件名合法性
@@ -148,19 +155,59 @@ def test_find_unsafe_names_non_recursive(tmp_path, monkeypatch):
     assert [rel for rel, _ in found] == ["c:d.mp4"]
 
 
+def _pathlib_child(parent: Path, name: str):
+    """用 pathlib **内部**拼子路径的那套机制构造子路径。
+
+    pathlib 的私有入口在版本间换过名字：3.11 / 3.12 是
+    ``_make_child_relpath``，3.13 重写成 ``_from_parsed_string``。
+    这里按可用性挑一个 —— 两边都必须保住原始名。
+
+    返回 None 表示当前版本没有可识别的入口。
+    """
+    rel = getattr(parent, "_make_child_relpath", None)
+    if rel is not None:
+        return rel(name)
+    parsed = getattr(parent, "_from_parsed_string", None)
+    if parsed is not None:
+        return parsed(str(parent) + os.sep + name)
+    return None
+
+
 def test_raw_name_survives_pathlib_parsing(tmp_path):
-    """守住这个前提：``rglob`` 拿到的 ``.name`` 必须还是原始名。
+    """守住这个前提：目录遍历拿到的 ``.name`` 必须还是原始名。
 
     pathlib 在 Windows 上把 ``a:b.mp4`` 解析成「驱动器 a: + 文件 b.mp4」，
     ``.name`` 就变成 ``b.mp4``，冒号没了 —— 非法名检测会静默失效。
-    ``rglob`` 用 ``_make_child_relpath`` 拼路径，不走重新解析，名字能保住。
+    目录遍历用 ``_make_child_relpath``（3.11 / 3.12）或
+    ``_from_parsed_string``（3.13）拼子路径，不走重新解析，名字能保住。
     """
     raw = _raw_child(tmp_path, "a:b.mp4")
-    child = tmp_path._make_child_relpath("a:b.mp4")
+    child = _pathlib_child(tmp_path, "a:b.mp4")
+    if child is None:
+        pytest.skip("当前 pathlib 没有可识别的子路径构造入口")
     assert child.name == "a:b.mp4"
     # 对照组：用 / 拼会被改写
     assert (tmp_path / "a:b.mp4").name != "a:b.mp4"
     assert raw.name == "a:b.mp4"
+
+
+@POSIX_ONLY
+def test_find_unsafe_names_on_real_posix_file(tmp_path):
+    """真建一个带冒号的文件，扫描必须认出来。
+
+    Windows / NTFS 建不出这种名字（连 ``stat`` 都会失败），所以这条
+    只能在 POSIX 上验 —— 由 CI 的 macOS / ubuntu runner 执行。
+
+    这是「目录遍历保住原始名」这个前提的**端到端**检查：
+    走的是真的 ``rglob``，不是假的目录项。
+    """
+    d = tmp_path / "ok"
+    d.mkdir()
+    (d / "a:b.mp4").write_bytes(b"x")
+
+    found = fscompat.find_unsafe_names(tmp_path)
+
+    assert [rel for rel, _ in found] == ["ok/a:b.mp4"]
 
 
 # --------------------------------------------------------------------------
