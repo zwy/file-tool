@@ -180,14 +180,18 @@ def test_raw_name_survives_pathlib_parsing(tmp_path):
     ``.name`` 就变成 ``b.mp4``，冒号没了 —— 非法名检测会静默失效。
     目录遍历用 ``_make_child_relpath``（3.11 / 3.12）或
     ``_from_parsed_string``（3.13）拼子路径，不走重新解析，名字能保住。
+
+    POSIX 上没有驱动器解析这一说，``/`` 拼出来的名字本来就是对的 ——
+    所以「对照组」只在 Windows 上成立。
     """
     raw = _raw_child(tmp_path, "a:b.mp4")
     child = _pathlib_child(tmp_path, "a:b.mp4")
     if child is None:
         pytest.skip("当前 pathlib 没有可识别的子路径构造入口")
     assert child.name == "a:b.mp4"
-    # 对照组：用 / 拼会被改写
-    assert (tmp_path / "a:b.mp4").name != "a:b.mp4"
+    # 对照组：Windows 上用 / 拼会被改写成「驱动器 a: + 文件 b.mp4」
+    if os.name == "nt":
+        assert (tmp_path / "a:b.mp4").name != "a:b.mp4"
     assert raw.name == "a:b.mp4"
 
 
