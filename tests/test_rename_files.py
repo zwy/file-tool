@@ -124,7 +124,7 @@ def test_domestic_prefix_directory_is_skipped(tmp_path, ruleset):
 def test_nested_files_are_handled(tmp_path, ruleset):
     """番号目录往下的子目录里的文件也要处理。"""
     make(tmp_path, "ACHJ-038/原标题子目录/001.jpg")
-    make(tmp_path, "TEA-240813-08/132 -SSQW/SSQWQS/图片/x.jpg")
+    make(tmp_path, "ACHJ-038/132 -SSQW/SSQWQS/图片/x.jpg")
     plan = plan_for(tmp_path, ruleset)
     # 两个文件的文件名里都没有番号 -> 不进计划
     assert plan.items == []

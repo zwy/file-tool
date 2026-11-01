@@ -34,11 +34,11 @@ def test_detect_flat(ruleset, tmp_path):
 
 def test_detect_nested(ruleset, tmp_path):
     (tmp_path / "SDMM028C").mkdir()
-    (tmp_path / "MON004").mkdir()
+    (tmp_path / "MIDE004").mkdir()
 
     shape, reason, numbered, files = tidy_mod.detect_shape(tmp_path, ruleset)
     assert shape is Shape.NESTED
-    assert set(numbered) == {"SDMM028C", "MON004"}
+    assert set(numbered) == {"SDMM028C", "MIDE004"}
 
 
 def test_detect_mixed(ruleset, tmp_path):
@@ -154,13 +154,13 @@ def test_apply_tidy_keeps_forks_when_asked(ruleset, tmp_path):
 
 def test_nested_titles_are_not_renamed(ruleset, tmp_path):
     """嵌套层的原始标题不是番号，不能被改名。"""
-    (tmp_path / "DOW24070403").mkdir()
+    (tmp_path / "SDMM028C").mkdir()
     title = "某个中文标题.mp4"
-    touch(tmp_path, f"DOW24070403/{title}")
+    touch(tmp_path, f"SDMM028C/{title}")
 
     plan = tidy_mod.build_tidy_plan(tmp_path, ruleset)
     renamed = [s for s in plan.steps if s.kind is StepKind.RENAME]
     # 只改顶层目录名，嵌套内容不动
     assert renamed
     assert renamed[0].count == 1
-    assert (tmp_path / "DOW24070403" / title).exists()
+    assert (tmp_path / "SDMM028C" / title).exists()

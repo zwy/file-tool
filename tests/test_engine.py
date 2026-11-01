@@ -30,15 +30,11 @@ def plan_for(ruleset, name: str):
         ("aavv39.xyz@WAAA355", "WAAA-355"),
         # 厂牌 + 数字（无横杠）
         ("SDMM028C", "SDMM-028C"),
-        ("MON004", "MON-004"),
+        ("MIDE004", "MIDE-004"),
         ("CAWD660CX", "CAWD-660CX"),
         ("DNW102A", "DNW-102A"),
-        # 日期型
-        ("DOW24070403", "DOW-240704-03"),
-        ("TEA24080208", "TEA-240802-08"),
-        ("7K24042301", "7K-240423-01"),
         # 小写厂牌
-        ("xfxfz14468", "xfxfz-14468"),
+        ("nizuia00877", "nizuia-00877"),
         ("dvdms00300a", "dvdms-00300a"),
         # 数字前缀
         ("230ORECO-640CX", "ORECO-640CX"),
@@ -63,6 +59,24 @@ def test_normalize(ruleset, original, expected):
         "FLUP-1131428",
         "FLUP11223-2",
         "FLUP-11223 (2)",
+        # 日期型（厂牌 + YYMMDD + 序号）是国产资源站的目录编号格式
+        "DOW24070403",
+        "DOW-240704-03",
+        "TEA24080208",
+        "TEA-240802-08",
+        "7K24042301",
+        "7K-240423-01",
+        "LRO-240506-23",
+        "HEA-240609-02",
+        "KEO24040901",
+        "WLF-240303-08",
+        "DEL-240223-11",
+        "XZO-240226-12",
+        # MON、xfxfz 同样是国产资源站的编号
+        "MON004",
+        "MON-006",
+        "xfxfz14468",
+        "xfxfz-14681",
     ],
 )
 def test_domestic_prefix_is_not_a_code(ruleset, original):
@@ -77,10 +91,7 @@ def test_domestic_prefix_is_not_a_code(ruleset, original):
     "original,expected",
     [
         # 规范名必须能反解回自己（幂等）—— 否则第二次跑 rename 会改坏目录
-        ("DOW-240706-24", "DOW-240706-24"),
-        ("7K-240423-01", "7K-240423-01"),
-        ("TEA-240806-13", "TEA-240806-13"),
-        ("xfxfz-14681", "xfxfz-14681"),
+        ("dvdms-00300b", "dvdms-00300b"),
         ("sdmu-00877b", "sdmu-00877b"),
         ("SVDVD-840 (1)", "SVDVD-840 (1)"),
         ("MAAN-961", "MAAN-961"),
@@ -99,21 +110,73 @@ def test_canonical_name_is_idempotent(ruleset, original, expected):
 
 def test_optional_group_is_not_rendered_as_none(ruleset):
     """没参与匹配的可选分组是 None，不能渲染成字符串 "None"。"""
-    item = plan_for(ruleset, "xfxfz-14681")
-    assert item.target == "xfxfz-14681"
+    item = plan_for(ruleset, "dvdms-00300b")
+    assert item.target == "dvdms-00300b"
     assert "None" not in item.target
 
 
-def test_hyphen_duplicate_strip_does_not_override_correct_parse(ruleset):
+def test_hyphen_duplicate_strip_does_not_override_correct_parse(tmp_path):
     """基准已经能正确解析时，条件剥离不得用错误结果覆盖它。
 
-    `DOW-240706-24` 本身就该被日期型规则解析成 `DOW-240706-24`；
-    剥掉 `-24` 后剩下的 `DOW-240706` 会被「厂牌-数字」规则抢先匹配，
-    变成错误的 `DOW-240706 (24)`。
+    这里用**合成规则集**而不是具体厂牌 —— 因为要测的是引擎行为：
+    只要「基准能匹配」且「剥掉之后也能匹配但结果不同」，引擎就必须
+    保留基准，不能让剥离结果覆盖它。
+
+    真实踩过的坑是 `DOW-240706-24`：日期型规则能正确解析成
+    `DOW-240706-24`，而剥掉 `-24` 后剩下的 `DOW-240706` 会被
+    「厂牌-数字」规则抢先匹配，变成错误的 `DOW-240706 (24)`。
     """
-    item = plan_for(ruleset, "DOW-240706-24")
-    assert item.target == "DOW-240706-24"
+    import yaml
+
+    rules_path = tmp_path / "synthetic.yaml"
+    rules_path.write_text(
+        yaml.safe_dump(
+            {
+                "version": 1,
+                "preprocess": [
+                    {
+                        "name": "strip_hyphen_dup",
+                        "pattern": r"-(?P<dup>\d+)$",
+                        "capture": "dup",
+                        "conditional": True,
+                    }
+                ],
+                "matches": [
+                    {
+                        # 基准规则：厂牌-日期-序号
+                        "name": "date_style",
+                        "pattern": r"^(?P<studio>[A-Z]{3})-(?P<date>\d{6})-(?P<seq>\d{2})$",
+                        "template": "{studio}-{date}-{seq}",
+                        "dup_suffix": " ({dup})",
+                        "priority": 100,
+                    },
+                    {
+                        # 抢先匹配的规则：无横杠的厂牌+数字
+                        "name": "studio_num_ver",
+                        "pattern": r"^(?P<studio>[A-Z]{3})(?P<num>\d{6})$",
+                        "template": "{studio}-{num}",
+                        "dup_suffix": " ({dup})",
+                        "priority": 90,
+                    },
+                ],
+                "dup_sources": ["dup"],
+            },
+            allow_unicode=True,
+        ),
+        encoding="utf-8",
+    )
+    synthetic = engine.load_ruleset(rules_path)
+
+    item = plan_for(synthetic, "ABC-240706-24")
+    assert item.target == "ABC-240706-24", f"被错误覆盖成 {item.target}"
     assert item.action is Action.KEEP
+
+    # 反过来：基准匹配不上时，条件剥离必须生效。
+    # 'ABC240706-24' 剥掉尾部 '-24'（重复副本标记）后剩 'ABC240706'，
+    # 被「厂牌+数字」规则匹配成 'ABC-240706'，标记按 dup_suffix 回贴成 ' (24)'
+    item2 = plan_for(synthetic, "ABC240706-24")
+    assert item2.target == "ABC-240706 (24)"
+    assert item2.action is Action.RENAME
 
 
 @pytest.mark.parametrize(
@@ -140,8 +203,8 @@ def test_already_normalized_is_kept(ruleset, original, expected):
         # 尾部重复副本标记要回贴，不能与主目录撞名
         ("SDMM030AC(1)", "SDMM-030AC (1)"),
         ("SDMM076(1)", "SDMM-076 (1)"),
-        ("TEA24080824 2", "TEA-240808-24 (2)"),
-        ("HEA24060902-2", "HEA-240609-02 (2)"),
+        ("SDMM028C 2", "SDMM-028C (2)"),
+        ("MAAN961-2", "MAAN-961 (2)"),
         # 域名里带 (N) 的副本
         ("aavv38(1).xyz@DVMM055A", "DVMM-055A (1)"),
     ],
@@ -187,14 +250,14 @@ def test_conflict_is_detected(ruleset):
 
 def test_apply_plan_renames_on_disk(tmp_path):
     (tmp_path / "SDMM028C").mkdir()
-    (tmp_path / "aavv38.xyz@MON004").mkdir()
+    (tmp_path / "aavv38.xyz@MIDE004").mkdir()
     ruleset = engine.load_ruleset(RULES)
     names = sorted(p.name for p in tmp_path.iterdir())
     plan = engine.build_plan(tmp_path, ruleset, names)
     done = engine.apply_plan(tmp_path, plan)
     assert len(done) == 2
     assert (tmp_path / "SDMM-028C").is_dir()
-    assert (tmp_path / "MON-004").is_dir()
+    assert (tmp_path / "MIDE-004").is_dir()
 
 
 def test_apply_plan_keeps_original_when_conflict(tmp_path):

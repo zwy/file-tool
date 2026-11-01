@@ -52,10 +52,10 @@ def test_different_content_is_not_merged(ruleset, tmp_path):
 
 def test_partial_overlap(ruleset, tmp_path):
     """部分同名不同、部分独有 -> PARTIAL。"""
-    make_dir(tmp_path, "TEA24080824", {"shared.mp4": b"same", "only-a.mp4": b"aaa"})
-    make_dir(tmp_path, "TEA24080824 2", {"shared.mp4": b"same", "only-b.mp4": b"bbb"})
+    make_dir(tmp_path, "SDMM028C", {"shared.mp4": b"same", "only-a.mp4": b"aaa"})
+    make_dir(tmp_path, "SDMM028C 2", {"shared.mp4": b"same", "only-b.mp4": b"bbb"})
 
-    plan = merge_mod.build_merge_plan(tmp_path, ruleset, ["TEA24080824", "TEA24080824 2"])
+    plan = merge_mod.build_merge_plan(tmp_path, ruleset, ["SDMM028C", "SDMM028C 2"])
     group = plan.groups[0]
     assert group.verdict is MergeVerdict.PARTIAL
     assert group.unique_files
@@ -114,36 +114,36 @@ def test_apply_merge_keeps_conflicting_file(ruleset, tmp_path):
 
 def test_apply_merge_partial_is_skipped_by_default(ruleset, tmp_path):
     """默认只合并完全一致的组，部分重叠不动。"""
-    make_dir(tmp_path, "TEA24080824", {"shared.mp4": b"same", "only-a.mp4": b"aaa"})
-    make_dir(tmp_path, "TEA24080824 2", {"shared.mp4": b"same", "only-b.mp4": b"bbb"})
+    make_dir(tmp_path, "SDMM028C", {"shared.mp4": b"same", "only-a.mp4": b"aaa"})
+    make_dir(tmp_path, "SDMM028C 2", {"shared.mp4": b"same", "only-b.mp4": b"bbb"})
 
-    plan = merge_mod.build_merge_plan(tmp_path, ruleset, ["TEA24080824", "TEA24080824 2"])
+    plan = merge_mod.build_merge_plan(tmp_path, ruleset, ["SDMM028C", "SDMM028C 2"])
     merge_mod.apply_merge_plan(tmp_path, plan)
 
-    assert (tmp_path / "TEA24080824").is_dir()
-    assert (tmp_path / "TEA24080824 2").is_dir()
+    assert (tmp_path / "SDMM028C").is_dir()
+    assert (tmp_path / "SDMM028C 2").is_dir()
 
 
 def test_apply_merge_partial_when_enabled(ruleset, tmp_path):
     """显式开启后，并入独有文件，冲突文件保留。"""
-    make_dir(tmp_path, "TEA24080824", {"shared.mp4": b"same", "only-a.mp4": b"aaa"})
-    make_dir(tmp_path, "TEA24080824 2", {"shared.mp4": b"same", "only-b.mp4": b"bbb"})
+    make_dir(tmp_path, "SDMM028C", {"shared.mp4": b"same", "only-a.mp4": b"aaa"})
+    make_dir(tmp_path, "SDMM028C 2", {"shared.mp4": b"same", "only-b.mp4": b"bbb"})
 
-    plan = merge_mod.build_merge_plan(tmp_path, ruleset, ["TEA24080824", "TEA24080824 2"])
+    plan = merge_mod.build_merge_plan(tmp_path, ruleset, ["SDMM028C", "SDMM028C 2"])
     merge_mod.apply_merge_plan(tmp_path, plan, only_duplicates=False)
 
-    primary = tmp_path / "TEA24080824"
+    primary = tmp_path / "SDMM028C"
     assert (primary / "only-a.mp4").exists()
     assert (primary / "only-b.mp4").exists()
 
 
 def test_nested_subdirectories_are_compared(ruleset, tmp_path):
     """嵌套子目录也要参与内容比对。"""
-    make_dir(tmp_path, "DOW24072205", {"01/1.mp4": b"part-one"})
-    make_dir(tmp_path, "DOW24072205-2", {"02/11.mp4": b"part-two"})
+    make_dir(tmp_path, "SDMM028C", {"01/1.mp4": b"part-one"})
+    make_dir(tmp_path, "SDMM028C-2", {"02/11.mp4": b"part-two"})
 
     plan = merge_mod.build_merge_plan(
-        tmp_path, ruleset, ["DOW24072205", "DOW24072205-2"]
+        tmp_path, ruleset, ["SDMM028C", "SDMM028C-2"]
     )
     group = plan.groups[0]
     assert group.verdict is MergeVerdict.PARTIAL

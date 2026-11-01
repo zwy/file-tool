@@ -12,11 +12,20 @@
 
 # 永不视为番号的名称形态（正则，匹配剥掉水印域名后的核心串）
 #
-# FLUP 是**国产内容**的编号，不是日本番号。把它排除掉有两个直接后果：
+# 这里的每一条都是**领域知识**：某个前缀/形态属于国产内容，不是日本番号。
+# 命中排除有两个直接后果：
 #   - rename 不会去改它（国产内容不该套番号规范）
 #   - isolate 会把它判为「不符合番号规范」而挪到国产文件夹（GC）
+#
+# FLUP 是国产内容的编号。日期型（厂牌 + YYMMDD + 序号）同样是国产资源站的
+# 目录编号 —— 实测库里 207 个这种目录（DOW/TEA/LRO/HEA/KEO/7K/WLF/DEL/XZO）
+# **全部零番号文件**，内容是中文标题、站点编号、破解视频。
 exclude:
   - '^FLUP[-_]?\d'
+  - '^(?:DOW|TEA|LRO|HEA|KEO|7K|WLF|DEL|XZO)[-_]?\d'
+  # MON、xfxfz 也是国产资源站的编号。实测 70 个这种目录（MON 17 + xfxfz 53）
+  # 全部零番号文件，内容是中文标题、站点编号、破解视频。
+  - '^(?:MON|xfxfz)[-_]?\d'
 
 version: 1
 description: "日本成人影片（番号）目录名规范化：去水印域名、去重复标记、统一 厂牌-数字 格式"
@@ -41,6 +50,10 @@ preprocess:
     description: "域名里带 (N) 的水印副本，如 aavv38(1).xyz@DVMM055A —— 记录 N 供回贴，避免与主目录撞名"
     pattern: '^[A-Za-z0-9._\-]*\((?P<wdup>\d+)\)\.[A-Za-z]{2,}@'
     capture: wdup
+
+  - name: strip_double_watermark_domain
+    description: "剥掉双重水印域名，如 aavv36.xyz@aavv36.xyz@SDMM095 -> SDMM095（单层规则只剥一次，剥不掉）"
+    pattern: '^(?:[A-Za-z0-9._()\-]+\.(?:com|net|org|xyz|cc|tv|me|info|top|club|shop|wang|live|site|space|pw|fun|icu|vip)@){2}'
 
   - name: strip_watermark_domain
     description: "剥掉前缀水印域名，如 aavv38.xyz@SDMM028 -> SDMM028"
@@ -70,14 +83,12 @@ preprocess:
     pattern: '^HD_'
 
 matches:
-  # ---- 日期型：厂牌 + YYMMDD + 序号，如 DOW24070403 / DOW-240704-03 / 7K-240423-01 ----
-  # 横杠可选：规范名带横杠，原始下载名不带，两种都要能解析（否则规范名反解不回来）
-  - name: date_style
-    description: "日期型番号 DOW24070403 / DOW-240704-03 / TEA24080208 / 7K-240423-01"
-    pattern: '^(?P<studio>[A-Z]{2,6}|\dK)[-]?(?P<date>\d{6})[-]?(?P<seq>\d{2})$'
-    template: '{studio}-{date}-{seq}'
-    dup_suffix: ' ({dup})'
-    priority: 100
+  # ---- 这里**没有**日期型规则 ----
+  # 「厂牌 + YYMMDD + 序号」（DOW24070403 / TEA-240802-08）是**国产资源站的
+  # 目录编号格式**，不是番号形态。实测库里 207 个这种目录全部零番号文件。
+  # 曾经有一条 date_style 规则把它当番号规范化，结果国产内容被塞进了番号库；
+  # 现在改成写进 exclude，并彻底删掉这条 match 规则 ——
+  # 留着它，以后每次下载国产内容都会被规范化进番号库再挪一次。
 
   # ---- FC2 专属格式 ----
   - name: fc2
