@@ -276,12 +276,14 @@ def build_isolation_plan(
 
     target_existing = set()
     if target.exists():
-        target_existing = {p.name for p in target.iterdir()}
+        # 忽略大小写 —— 目标目录里已有「只差大小写」的同名目录时，
+        # 挪过去就会在 exFAT 上撞名
+        target_existing = {fscompat.same_name_key(p.name) for p in target.iterdir()}
 
     for name in dirs:
         item = judge_directory(name, root, ruleset, move_empty=move_empty)
         plan.items.append(item)
-        if item.will_move and name in target_existing:
+        if item.will_move and fscompat.same_name_key(name) in target_existing:
             plan.conflicts.append(name)
 
     return plan
@@ -307,10 +309,11 @@ def apply_isolation_plan(
         if not src.is_dir():
             continue
         dst = target / item.name
-        if dst.exists():
+        # 目标是否已被占用 —— 忽略大小写判定（见 fscompat.colliding_entries）
+        if fscompat.colliding_entries(target, item.name):
             stem = item.name
             counter = 2
-            while (target / f"{stem} ({counter})").exists():
+            while fscompat.colliding_entries(target, f"{stem} ({counter})"):
                 counter += 1
             dst = target / f"{stem} ({counter})"
             renamed.append(f"{item.name} -> {dst.name}")

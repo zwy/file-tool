@@ -277,10 +277,16 @@ def build_plan(
     用于检测目标名冲突。
     """
     existing_set = set(existing) if existing is not None else set(names)
+    # 冲突判定一律**忽略大小写**。规则模板保留厂牌的原始大小写
+    # （club810 -> club-810、CLUB810 -> CLUB-810），两个目标只差大小写，
+    # 在 exFAT 上是同一个名字。判定交给文件系统的话，在大小写敏感的
+    # 卷上会漏判，整理完再拷到 exFAT 就撞名了。
+    existing_keys = {fscompat.same_name_key(n) for n in existing_set}
     ordered = ruleset.ordered_matches()
     dup_sources = ruleset.dup_sources or ["dup"]
     items: List[PlanItem] = []
     planned: Dict[str, str] = {}  # 目标名 -> 原始名，检测批次内重名
+    planned_keys: Dict[str, str] = {}  # 同上，但忽略大小写
 
     for name in names:
         core, captured = strip_noise(name, ruleset.preprocess)
@@ -315,7 +321,7 @@ def build_plan(
             )
             continue
 
-        if target in existing_set and target != name:
+        if fscompat.same_name_key(target) in existing_keys and target != name:
             items.append(
                 PlanItem(
                     original=name,
@@ -329,7 +335,7 @@ def build_plan(
             )
             continue
 
-        if target in planned:
+        if fscompat.same_name_key(target) in planned_keys:
             items.append(
                 PlanItem(
                     original=name,
@@ -338,12 +344,13 @@ def build_plan(
                     base=base or target,
                     action=Action.CONFLICT,
                     rule=rule_name,
-                    reason=f"与 {planned[target]} 目标名重复",
+                    reason=f"与 {planned_keys[fscompat.same_name_key(target)]} 目标名重复",
                 )
             )
             continue
 
         planned[target] = name
+        planned_keys[fscompat.same_name_key(target)] = name
         items.append(
             PlanItem(
                 original=name,
@@ -383,16 +390,27 @@ def apply_plan(root: Path, plan: Plan) -> "ApplyResult":
         if not src.exists():
             continue
         try:
-            if dst.exists():
-                # 仅大小写不同 —— 是同一个文件，必须走两步改名
-                if fscompat.is_same_file(src, dst):
+            # 目标名是否被占用 —— **忽略大小写**判定，见 fscompat.colliding_entries。
+            # 不能用 dst.exists()：那取决于卷的大小写语义，会让同一个库
+            # 在不同卷上整理出不同结果。
+            blockers = fscompat.colliding_entries(root, item.target)
+            if blockers:
+                same = []
+                others = []
+                for blocker in blockers:
+                    if fscompat.is_same_file(src, blocker):
+                        same.append(blocker)
+                    else:
+                        others.append(blocker)
+                if same and not others:
+                    # 仅大小写不同 —— 是同一个文件，必须走两步改名
                     fscompat.rename_case_only(src, dst)
                     renamed.append((item.original, dst.name))
                     continue
                 # 真冲突：另一个文件占了目标名，加序号兜底
                 stem, suffix = _split_suffix(item.target)
                 counter = 2
-                while (root / f"{stem} ({counter}){suffix}").exists():
+                while fscompat.colliding_entries(root, f"{stem} ({counter}){suffix}"):
                     counter += 1
                 dst = root / f"{stem} ({counter}){suffix}"
             src.rename(dst)

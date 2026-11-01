@@ -32,6 +32,29 @@ jobs:
       - name: 运行测试
         run: pytest -q
 
+      - name: 在大小写敏感的目录里再跑一遍（模拟 Linux / macOS）
+        # Linux ext4 与 macOS 的**大小写敏感**分区上，「目标名是否被占用」
+        # 的答案和 Windows 不一样：``CLUB-810.mp4`` 与 ``club-810.mp4``
+        # 在那里是两个文件，在 exFAT 上是同一个名字。
+        #
+        # 这套判定必须与卷的语义无关 —— 否则同一个库在两种卷上整理出的
+        # 结构会不一样，拷到 exFAT 上还会撞名。
+        #
+        # NTFS 支持目录级大小写敏感（WSL 用的就是它），用它把 POSIX 语义
+        # 搬到 Windows runner 上跑一遍，不需要额外的 POSIX runner。
+        # runner 不支持这个特性时跳过，不让 CI 因此变红。
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $base = Join-Path $env:RUNNER_TEMP 'case-sensitive'
+          New-Item -ItemType Directory -Force -Path $base | Out-Null
+          fsutil file setCaseSensitiveInfo $base enable
+          if ($LASTEXITCODE -ne 0) {
+            Write-Output "::notice::当前 runner 不支持目录级大小写敏感，跳过这一步"
+            exit 0
+          }
+          pytest -q --basetemp="$base/pt"
+
       - name: 校验规则文件可加载
         run: python -c "from file_tool import engine; from pathlib import Path; engine.load_ruleset(Path('rules/numbering.yaml')); print('rules ok')"
 

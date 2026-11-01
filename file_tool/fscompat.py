@@ -20,6 +20,15 @@ macOS 与 Windows 在**文件名规则、大小写语义、占用行为**上有�
    「只改大小写」的改名必须走两步（先挪临时名），否则 rename 会
    「无事发生」—— 系统认为源和目标是同一个文件。
 
+   但 Linux ext4、macOS 的**大小写敏感**分区是相反的：那里
+   ``a.mp4`` 与 ``A.mp4`` 是两个不同的文件。
+
+   这条差异不能问文件系统，得自己算 —— 否则同一个库在两种卷上
+   整理出的结果会不一样；更糟的是，在大小写敏感的卷上整理完再拷到
+   exFAT，两个只差大小写的文件就撞在了一起（exFAT 上根本放不下）。
+   所以「目标名是否已被占用」一律走 :func:`colliding_entries`，
+   与当前卷的语义无关。
+
 3. **路径表示**
    相对路径统一用 ``/`` 分隔，保证 JSON 输出与日志跨平台一致。
    ``str(Path.relative_to())`` 在 Windows 上给的是 ``\\``，会让
@@ -95,6 +104,52 @@ def is_windows_unsafe_name(name: str) -> Optional[str]:
     return None
 
 
+def same_name_key(name: str) -> str:
+    """名字的「同一性」比较键：**忽略大小写**。
+
+    这是整个项目判断「两个名字是不是同一个」的统一口径。
+
+    为什么不用 ``str.lower()``：``casefold()`` 是 Unicode 标准的
+    大小写折叠，``ß`` 会折成 ``ss``，比 ``lower()`` 更接近
+    NTFS / APFS 实际采用的大小写不敏感比较。
+
+    为什么不用 ``os.path.normcase()``：它在 POSIX 上是空操作，
+    可我们要的是**跨平台一致** —— 同一个库在 Windows 上和在
+    Linux 上的整理结果必须一样，否则库换个平台就乱了。
+    """
+    return name.casefold()
+
+
+def colliding_entries(dir_path: Path, name: str) -> List[Path]:
+    """目录里所有「忽略大小写后与 ``name`` 相同」的条目。
+
+    这是「目标名是否已被占用」的**唯一**判定入口，替代
+    ``Path.exists()``。
+
+    为什么不能直接用 ``exists()``：它的答案取决于**卷本身**的大小写
+    语义。Windows NTFS/exFAT 与 macOS APFS（默认）上，
+    ``exists("CLUB-810.mp4")`` 对实际叫 ``club-810.mp4`` 的文件
+    返回 True；Linux ext4 上返回 False。
+
+    同一个库在两种卷上的整理结果因此会分叉：
+    ``CLUB810.mp4`` 与 ``club-810.mp4`` 在 Linux 上会被当成
+    「目标名没被占用」而改名成功，在 exFAT 上却是**真冲突**。
+    等库拷到 exFAT 上，两个只差大小写的文件就撞了。
+
+    所以冲突判定必须自己算，且**永远忽略大小写** —— 整理出来的库
+    最终是要放到 exFAT 上的。
+
+    返回列表而不是单个路径：大小写敏感的卷上真可能同时存在
+    ``a.mp4`` 和 ``A.mp4``，两个都是占用者。
+    """
+    key = same_name_key(name)
+    try:
+        entries = list(dir_path.iterdir())
+    except OSError:
+        return []
+    return [p for p in entries if same_name_key(p.name) == key]
+
+
 def find_unsafe_names(
     root: Path, recursive: bool = True
 ) -> List[Tuple[str, str]]:
@@ -120,11 +175,44 @@ def to_posix_relpath(path: Path, root: Path) -> str:
     """相对 root 的相对路径，统一用 ``/`` 分隔。
 
     跨平台的 JSON 输出、下游脚本、日志比对都依赖这个表示统一。
+
+    **不用** ``path.relative_to(root)``：Python 3.12 起，Windows 上
+    ``relative_to`` 会把末段里带 ``:`` 的名字重新当成驱动器解析，
+    ``ok/a:b.mp4`` 被截成 ``a:b.mp4`` —— 中间层级整个丢掉。
+    病根在 3.12 的 ``PurePath.with_segments()``：它按位置重新解析
+    每一段，``a:b.mp4`` 被读成「驱动器 a: + 文件 b.mp4」。
+
+    自己按 ``parts`` 逐段比较，既跨版本稳定，也保得住原始名。
     """
-    try:
-        return path.relative_to(root).as_posix()
-    except ValueError:
+    path_parts = path.parts
+    root_parts = root.parts
+
+    index = 0
+    limit = min(len(path_parts), len(root_parts))
+    while index < limit and _same_part(path_parts[index], root_parts[index]):
+        index += 1
+
+    if index == 0:
+        # 根本不在 root 底下（不同盘 / 不同根）—— 退回绝对路径
         return path.as_posix()
+
+    rel_parts = path_parts[index:]
+    if not rel_parts:
+        # path 就是 root 本身
+        return "."
+    return "/".join(rel_parts)
+
+
+def _same_part(a: str, b: str) -> bool:
+    """路径段比较：Windows 上忽略大小写，POSIX 上精确匹配。
+
+    Windows 上 ``C:\\Users`` 与 ``c:\\users`` 是同一个目录；
+    POSIX 上 ``Users`` 与 ``users`` 是两个目录 —— 卷的语义不同，
+    这里也跟着不同。
+    """
+    if on_windows():
+        return a.casefold() == b.casefold()
+    return a == b
 
 
 def is_same_file(a: Path, b: Path) -> bool:
@@ -132,11 +220,27 @@ def is_same_file(a: Path, b: Path) -> bool:
 
     用于区分「目标已存在且是另一个文件」和「目标就是源本身，
     只是大小写不同」—— 后者必须走两步改名，不能当成冲突。
+
+    「同一个」的判定**忽略大小写**：``a.mp4`` 与 ``A.mp4`` 在
+    Windows / exFAT / APFS（默认）上就是同一个文件；在大小写敏感的
+    卷上虽然路径不同，但也必须当成同一个 —— 否则整理结果会随卷
+    的语义而变，库换个平台就乱了。
+
+    所以先试 ``os.path.samefile``（大小写不敏感的卷上直接命中），
+    失败再按「忽略大小写」在目录里找真实条目。
     """
     try:
         return os.path.samefile(a, b)
     except OSError:
-        return False
+        pass
+    # 大小写敏感的卷上 b 可能压根不存在 —— 按忽略大小写找真实条目
+    for entry in colliding_entries(b.parent, b.name):
+        try:
+            if os.path.samefile(a, entry):
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def rename_case_only(src: Path, dst: Path) -> None:

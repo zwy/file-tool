@@ -38,7 +38,6 @@
 """
 from __future__ import annotations
 
-import os
 import re
 from enum import Enum
 from pathlib import Path
@@ -315,15 +314,15 @@ def build_file_plan(root: Path, ruleset: RuleSet) -> FilePlan:
                     plan.items.append(item)
                     continue
 
-                dst_path = path.parent / new_name
-                if dst_path.exists():
-                    if _is_same_file(path, dst_path):
-                        # 同一个文件，仅大小写不同 —— 不是冲突
-                        item.target = new_name
-                        item.action = FileAction.RENAME
-                        item.reason = "仅大小写不同"
-                        plan.items.append(item)
-                        continue
+                status = _target_status(path, new_name)
+                if status == "case":
+                    # 同一个文件，仅大小写不同 —— 不是冲突
+                    item.target = new_name
+                    item.action = FileAction.RENAME
+                    item.reason = "仅大小写不同"
+                    plan.items.append(item)
+                    continue
+                if status == "conflict":
                     item.target = new_name
                     item.action = FileAction.CONFLICT
                     item.reason = "目标名已存在，未覆盖"
@@ -355,22 +354,22 @@ def build_file_plan(root: Path, ruleset: RuleSet) -> FilePlan:
 
             # 冲突检测不能用 ``Path.exists()`` ——
             # exFAT / APFS（默认）大小写不敏感，``CLUB-880.mp4`` 和
-            # ``club-880.mp4`` 指的是**同一个文件**，exists() 恒为真。
-            # 那样每个「目录名小写、文件名大写」的目录都会被误判成冲突，
-            # 文件名就永远规范化不了。
+            # ``club-880.mp4`` 指的是**同一个文件**，exists() 恒为真；
+            # 而 Linux ext4 上恒为假。同一个库在两种卷上会得到不同结果，
+            # 整理完再拷到 exFAT 就撞名了。
             #
             # 真正的冲突是「另一个文件占了目标名」。判定靠文件身份
             # （inode + 设备号），同一个文件只是大小写不同 -> 那是
             # 纯大小写改名，走两步 rename，不算冲突。
-            dst_path = path.parent / new_name
-            if dst_path.exists():
-                if _is_same_file(path, dst_path):
-                    # 同一个文件，仅大小写不同 —— 不是冲突
-                    item.target = new_name
-                    item.action = FileAction.RENAME
-                    item.reason = "仅大小写不同"
-                    plan.items.append(item)
-                    continue
+            status = _target_status(path, new_name)
+            if status == "case":
+                # 同一个文件，仅大小写不同 —— 不是冲突
+                item.target = new_name
+                item.action = FileAction.RENAME
+                item.reason = "仅大小写不同"
+                plan.items.append(item)
+                continue
+            if status == "conflict":
                 item.target = new_name
                 item.action = FileAction.CONFLICT
                 item.reason = "目标名已存在，未覆盖"
@@ -403,6 +402,29 @@ def _is_same_file(a: Path, b: Path) -> bool:
     return fscompat.is_same_file(a, b)
 
 
+def _target_status(path: Path, new_name: str) -> str:
+    """判断改名目标是否被占用。
+
+    返回三种状态：
+
+    - ``"free"``   —— 目标名没被任何人占，可以改
+    - ``"case"``   —— 只有「源文件自己」占着（仅大小写不同）→ 两步改名
+    - ``"conflict"`` —— 有别的文件占着 → 冲突，绝不覆盖
+
+    占用判定**忽略大小写**（见 :func:`file_tool.fscompat.colliding_entries`）。
+    不能用 ``Path.exists()`` —— 那取决于卷的大小写语义：Windows/exFAT
+    上恒为真，Linux ext4 上为假。同一个库在两种卷上的整理结果会分叉，
+    而整理出来的库最终是要放到 exFAT 上的。
+    """
+    blockers = fscompat.colliding_entries(path.parent, new_name)
+    if not blockers:
+        return "free"
+    for blocker in blockers:
+        if not _is_same_file(path, blocker):
+            return "conflict"
+    return "case"
+
+
 def apply_file_plan(root: Path, plan: FilePlan) -> Dict[str, object]:
     """执行文件改名。冲突绝不覆盖。"""
     renamed: List[tuple[str, str]] = []
@@ -417,15 +439,14 @@ def apply_file_plan(root: Path, plan: FilePlan) -> Dict[str, object]:
             continue
         dst = src.parent / item.target
 
-        if dst.exists():
+        # 目标名是否被占用 —— 忽略大小写判定，见 fscompat.colliding_entries
+        blockers = fscompat.colliding_entries(src.parent, item.target)
+        if blockers:
             # 目标已存在 —— 只有「同一个文件、仅大小写不同」才继续
-            try:
-                if os.path.samefile(src, dst):
-                    _rename_case_only(src, dst)
-                    renamed.append((item.relpath, item.target))
-                    continue
-            except OSError:
-                pass
+            if all(fscompat.is_same_file(src, b) for b in blockers):
+                _rename_case_only(src, dst)
+                renamed.append((item.relpath, item.target))
+                continue
             conflicts.append(item.relpath)
             continue
 

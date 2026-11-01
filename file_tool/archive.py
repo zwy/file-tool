@@ -201,6 +201,12 @@ def build_archive_plan(
         else:
             existing_files.add(name)
 
+    # 撞名判定一律**忽略大小写**（见 fscompat.colliding_entries 的说明）：
+    # 卷本身的大小写语义不能决定结果，否则同一个库在 exFAT 和 ext4 上
+    # 整理出的结构会不一样，拷到 exFAT 上还会撞名。
+    existing_dir_keys = {fscompat.same_name_key(n) for n in existing_dirs}
+    existing_file_keys = {fscompat.same_name_key(n) for n in existing_files}
+
     buckets: Dict[str, List[str]] = {}
     for name in names:
         # 先看名字 —— 不能用 ``root / name`` 拼路径：
@@ -233,30 +239,31 @@ def build_archive_plan(
         group = ArchiveGroup(name=key)
 
         # 目标目录名与现有文件撞名 -> 整组不处理
-        if key in existing_files:
+        if fscompat.same_name_key(key) in existing_file_keys:
             plan.blocked.append(key)
             continue
 
         target_dir = root / key
         # 目标目录已存在时，内部的同名文件算冲突
         existing_inside: set[str] = set()
-        if key in existing_dirs:
+        if fscompat.same_name_key(key) in existing_dir_keys:
             for p in target_dir.iterdir():
                 if p.is_file():
-                    existing_inside.add(p.name)
+                    existing_inside.add(fscompat.same_name_key(p.name))
 
         for name in buckets[key]:
             stem, ext = os.path.splitext(name)
+            name_key = fscompat.same_name_key(name)
             item = ArchiveItem(
                 filename=name,
                 group=key,
                 variant=stem,
-                dest=name if name not in existing_inside else "",
+                dest=name if name_key not in existing_inside else "",
             )
-            if name in existing_inside:
+            if name_key in existing_inside:
                 group.conflicts.append(name)
             else:
-                existing_inside.add(name)
+                existing_inside.add(name_key)
             group.items.append(item)
 
         plan.groups.append(group)
@@ -313,7 +320,8 @@ def apply_archive_plan(
             dst = target_dir / item.dest
             if not src.exists():
                 continue
-            if dst.exists():
+            # 目标名是否被占用 —— 忽略大小写判定
+            if fscompat.colliding_entries(target_dir, item.dest):
                 conflicts += 1
                 continue
             try:

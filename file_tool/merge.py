@@ -432,12 +432,24 @@ def _merge_into(src: Path, dst: Path) -> Tuple[List[str], List[str], List[str]]:
             continue
 
         try:
-            if not target.exists():
+            # 目标名是否被占用 —— **忽略大小写**判定（见 fscompat.colliding_entries）。
+            # 不能用 target.exists()：那取决于卷的大小写语义，在大小写敏感的
+            # 卷上会漏判，把两个只差大小写的文件当成「不重名」并进去 ——
+            # 等库拷到 exFAT 上就撞名了。
+            blockers = fscompat.colliding_entries(target.parent, target.name)
+            if not blockers:
                 shutil.move(str(path), str(target))
                 moved.append(rel_str)
                 continue
 
-            if file_digest(target) == file_digest(path):
+            # 已存在同名文件：内容相同 -> 删掉源文件（真重复）
+            #                 内容不同 -> 保留源文件，记为冲突（绝不覆盖）
+            duplicate = False
+            for blocker in blockers:
+                if file_digest(blocker) == file_digest(path):
+                    duplicate = True
+                    break
+            if duplicate:
                 path.unlink()
                 moved.append(rel_str)
             else:
