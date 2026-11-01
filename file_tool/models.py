@@ -111,8 +111,37 @@ class RuleSet(BaseModel):
     description: str = ""
     preprocess: List[PreprocessRule] = Field(default_factory=list)
     matches: List[MatchRule] = Field(default_factory=list)
+    exclude: List[str] = Field(default_factory=list)
+    """永不视为番号的名称形态（正则）。
+
+    匹配对象是**剥掉水印域名之后的核心串**。例如 ``FLUP-1131428``、
+    ``FLUP113730`` —— FLUP 是国产内容的编号，不是日本番号。
+
+    命中排除的名字一律不当番号处理。两个直接后果：
+
+    - ``rename`` 不会去改它们（国产内容不该套番号规范）
+    - ``isolate`` 会把它们判为「不符合番号规范」而挪到国产文件夹，
+      番号库里就不留国产内容了
+
+    排除是「整类形态」的判断，必须写在规则文件里而不是代码里 ——
+    哪个前缀属于国产是领域知识，会随资料来源变化。
+    """
     dup_sources: List[str] = Field(default_factory=lambda: ["dup", "wdup"])
     """回贴标记的取值优先级：按顺序取第一个存在的捕获组，填入 ``{dup}`` 槽位。"""
+
+    @field_validator("exclude")
+    @classmethod
+    def _check_exclude(cls, v: List[str]) -> List[str]:
+        for pattern in v:
+            try:
+                re.compile(pattern)
+            except re.error as exc:
+                raise ValueError(f"无效排除正则 {pattern!r}: {exc}") from exc
+        return v
+
+    def is_excluded(self, core: str) -> bool:
+        """核心串是否命中排除名单。"""
+        return any(re.search(pattern, core) for pattern in self.exclude)
 
     def ordered_matches(self) -> List[MatchRule]:
         """按 priority 降序返回匹配规则（同优先级保持文件内顺序）。"""

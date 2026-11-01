@@ -172,7 +172,7 @@ def _looks_numbered(name: str, ruleset: RuleSet) -> bool:
     dup_sources = ruleset.dup_sources or ["dup"]
     core, captured = engine.strip_noise(name, ruleset.preprocess)
     base, _target, _rule, _desc, _core = engine.resolve_target(
-        core, captured, ordered, ruleset.preprocess, dup_sources
+        core, captured, ordered, ruleset.preprocess, dup_sources, ruleset.exclude
     )
     return bool(base)
 

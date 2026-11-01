@@ -19,6 +19,7 @@ from file_tool import archive as archive_mod
 from file_tool import clean as clean_mod
 from file_tool import isolate as isolate_mod
 from file_tool import merge as merge_mod
+from file_tool import rename_files as rename_files_mod
 from file_tool import tidy as tidy_mod
 from file_tool.merge import MergeAction, MergeVerdict
 from file_tool.models import Action, RuleSet
@@ -102,6 +103,104 @@ def rename(
     typer.secho(f"已改名 {len(done)} 个目录。", fg=typer.colors.GREEN)
     for old, new in done:
         typer.echo(f"  {old}  ->  {new}")
+
+
+@app.command("rename-files")
+def rename_files(
+    root: str = typer.Argument(..., help="要整理的父目录"),
+    apply: bool = typer.Option(False, "--apply", help="真正执行改名（默认只预览）"),
+    rules: Optional[Path] = typer.Option(None, "--rules", help="规则文件路径"),
+    json_out: bool = typer.Option(False, "--json", help="以 JSON 输出计划"),
+) -> None:
+    """把文件名里带的番号规范化成所在目录的番号。
+
+    目录名已经规范过了，但文件还留着下载时的原样
+    （``kfa11.com@ACHJ038.jpg``）。本命令把它改成 ``ACHJ-038.jpg``。
+
+    - 番号取**顶层目录**的番号（往下 2~5 层是原标题子目录、分类分组、
+      解压残留，不承载番号）
+    - 只处理文件名里**本来就有番号**的；中文标题、``001.jpg`` 序列、
+      原始导出名一律不动 —— 那些名字本身就是内容标识
+    - 冲突绝不覆盖：目标已存在就跳过并报告
+    """
+    root_dir = _resolve_root(root)
+    ruleset = _load_rules(rules)
+    plan = rename_files_mod.build_file_plan(root_dir, ruleset)
+
+    if json_out:
+        typer.echo(json.dumps(
+            {"root": plan.root, "summary": plan.summary(),
+             "items": [i.model_dump(mode="json") for i in plan.items]},
+            ensure_ascii=False, indent=2,
+        ))
+    else:
+        _print_file_plan(plan)
+
+    if not apply:
+        counts = plan.summary()
+        typer.secho(
+            f"\n预览模式：{counts['rename']} 个文件待改名、"
+            f"{counts['keep']} 个已是规范名、{counts['skip']} 个判定不动、"
+            f"{counts['conflict']} 个冲突。"
+            f" 另有 {counts['no_code_files']} 个文件名里没有番号，保持原样。"
+            f" 确认无误后加 --apply 执行。",
+            fg=typer.colors.YELLOW,
+        )
+        return
+
+    result = rename_files_mod.apply_file_plan(root_dir, plan)
+    typer.secho(
+        f"改名完成：{len(result['renamed'])} 个文件已规范化，"
+        f"{len(result['conflicts'])} 个冲突跳过，{len(result['failed'])} 个失败。",
+        fg=typer.colors.GREEN,
+    )
+    for old, new in result["renamed"][:50]:
+        typer.echo(f"  {old}  ->  {new}")
+    if len(result["renamed"]) > 50:
+        typer.echo(f"  … 另有 {len(result['renamed']) - 50} 个")
+    if result["conflicts"]:
+        typer.secho(
+            f"冲突（目标已存在，未覆盖）{len(result['conflicts'])} 个："
+            f"{', '.join(result['conflicts'][:3])}",
+            fg=typer.colors.YELLOW,
+        )
+    if result["failed"]:
+        typer.secho(f"失败 {len(result['failed'])} 个。", fg=typer.colors.RED)
+
+
+def _print_file_plan(plan) -> None:
+    typer.secho(f"目录：{plan.root}", bold=True)
+    counts = plan.summary()
+    typer.secho(
+        f"番号目录 {counts['code_dirs']} 个 | "
+        f"待改名 {counts['rename']} | 已规范 {counts['keep']} | "
+        f"判定不动 {counts['skip']} | 冲突 {counts['conflict']}",
+        fg=typer.colors.CYAN,
+    )
+    typer.secho(
+        f"另有 {counts['no_code_files']} 个文件名里没有番号（中文标题、图片序列、"
+        f"原始导出名等），保持原样。",
+        fg=typer.colors.CYAN,
+    )
+
+    if plan.rename_items:
+        typer.secho("\n将改名：", bold=True)
+        for item in plan.rename_items[:20]:
+            typer.echo(f"  {item.relpath}  ->  {item.target}")
+        if len(plan.rename_items) > 20:
+            typer.echo(f"  … 另有 {len(plan.rename_items) - 20} 个")
+
+    if plan.skip_items:
+        typer.secho("\n判定不动（文件名是别的番号）：", fg=typer.colors.YELLOW)
+        for item in plan.skip_items[:10]:
+            typer.echo(f"  {item.relpath}  —— {item.reason}")
+        if len(plan.skip_items) > 10:
+            typer.echo(f"  … 另有 {len(plan.skip_items) - 10} 个")
+
+    if plan.conflict_items:
+        typer.secho("\n冲突（目标已存在，不会覆盖）：", fg=typer.colors.RED)
+        for item in plan.conflict_items[:10]:
+            typer.echo(f"  {item.relpath}  ->  {item.target}")
 
 
 @app.command()

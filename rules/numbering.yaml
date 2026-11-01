@@ -8,10 +8,31 @@
 #   template    —— 用命名分组回填规范名；{raw} = 剥离后的核心串
 #   dup_suffix  —— 重复副本标记的回贴方式；{dup} = 剥离出的标记序号
 #
-# 设计约定：厂牌与数字之间统一用「-」分隔，版本后缀（���如 C / CX / AC）原样保留在末尾。
+# 设计约定：厂牌与数字之间统一用「-」分隔，版本后缀（如 C / CX / AC）原样保留在末尾。
+
+# 永不视为番号的名称形态（正则，匹配剥掉水印域名后的核心串）
+#
+# FLUP 是**国产内容**的编号，不是日本番号。把它排除掉有两个直接后果：
+#   - rename 不会去改它（国产内容不该套番号规范）
+#   - isolate 会把它判为「不符合番号规范」而挪到国产文件夹（GC）
+exclude:
+  - '^FLUP[-_]?\d'
 
 version: 1
 description: "日本成人影片（番号）目录名规范化：去水印域名、去重复标记、统一 厂牌-数字 格式"
+
+# 幂等性要求（重要）
+# ------------------
+# 规则输出的是**规范名**，规范名必须能被同一套规则重新解析回自己，
+# 否则第二次跑 rename 就会把已经整理好的目录改坏。实测踩过的坑：
+#
+#   - 日期型规则只吃无横杠输入，却输出带横杠的 `DOW-240706-24`
+#     -> 重新解析时被「厂牌-数字」规则抢先匹配，改成 `DOW-240706 (24)`
+#   - 小写厂牌规则只吃无横杠输入，却输出带横杠的 `xfxfz-14681`
+#     -> 重新解析时可选分组没匹配上，渲染出 `xfxfz-14681None`
+#
+# 所以：凡是本文件产出过的形态，都必须能被本文件重新解析。
+# 改动任何一条 match 规则后，请对全库跑一次 rename 预览，确认破坏数为 0。
 
 preprocess:
   # 注意顺序：先捕获「域名里带 (N)」的副本标记，再剥域名。
@@ -27,8 +48,8 @@ preprocess:
     capture: domain
 
   - name: strip_paren_dup
-    description: "剥掉尾部重复副本标记 (1)"
-    pattern: '\((?P<dup>\d+)\)$'
+    description: "剥掉尾部重复副本标记 (1)（连前导空格一起剥 —— 否则规范名 'X-001 (1)' 反解不回来）"
+    pattern: '\s*\((?P<dup>\d+)\)$'
     capture: dup
     conditional: true
 
@@ -49,10 +70,11 @@ preprocess:
     pattern: '^HD_'
 
 matches:
-  # ---- 日期型：厂牌 + YYMMDD + 序号，如 DOW24070403 / 7K24042301 ----
+  # ---- 日期型：厂牌 + YYMMDD + 序号，如 DOW24070403 / DOW-240704-03 / 7K-240423-01 ----
+  # 横杠可选：规范名带横杠，原始下载名不带，两种都要能解析（否则规范名反解不回来）
   - name: date_style
-    description: "日期型番号 DOW24070403 / TEA24080208 / 7K24042301"
-    pattern: '^(?P<studio>[A-Z]{2,6}|[0-9]K)(?P<date>\d{6})(?P<seq>\d{2})$'
+    description: "日期型番号 DOW24070403 / DOW-240704-03 / TEA24080208 / 7K-240423-01"
+    pattern: '^(?P<studio>[A-Z]{2,6}|\dK)[-]?(?P<date>\d{6})[-]?(?P<seq>\d{2})$'
     template: '{studio}-{date}-{seq}'
     dup_suffix: ' ({dup})'
     priority: 100
@@ -89,18 +111,16 @@ matches:
     dup_suffix: ' ({dup})'
     priority: 80
 
-  # ---- FLUP 系列：厂牌 + 变长数字（112/113 系列 + 2~5 位序号） ----
-  - name: flup
-    description: "FLUP 系列 FLUP11201 / FLUP113730 / FLUP1122285（数字段整体保留，不臆测拆分）"
-    pattern: '^(?P<studio>FLUP)(?P<num>\d{5,7})$'
-    template: '{studio}-{num}'
-    dup_suffix: ' ({dup})'
-    priority: 75
+  # ---- FLUP 不在这里 ----
+  # FLUP-* 是国产内容的编号，不是日本番号。
+  # 不当番号处理的好处：目录名匹配不上番号规则 -> isolate 会把它判为
+  # 「不符合番号规范」而挪到国产文件夹（GC），番号库里就不留国产内容了。
 
-  # ---- 小写厂牌带横杠，如 avop-235-C ----
+  # ---- 小写厂牌带横杠，如 avop-235-C / sdmu-00877b ----
+  # 版本后缀可能是大写（C）也可能是小写（b），两种都要收
   - name: lower_dash
-    description: "小写厂牌带横杠 avop-235-C"
-    pattern: '^(?P<studio>[a-z]{3,8})-(?P<num>\d{1,6})(?P<ver>-[A-Z]{1,3})?$'
+    description: "小写厂牌带横杠 avop-235-C / sdmu-00877b"
+    pattern: '^(?P<studio>[a-z]{3,8})-(?P<num>\d{1,8})(?P<ver>-[A-Za-z]{1,3}|[A-Za-z]{1,3})?$'
     template: '{studio}-{num}{ver}'
     dup_suffix: ' ({dup})'
     priority: 70

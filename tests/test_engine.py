@@ -37,10 +37,6 @@ def plan_for(ruleset, name: str):
         ("DOW24070403", "DOW-240704-03"),
         ("TEA24080208", "TEA-240802-08"),
         ("7K24042301", "7K-240423-01"),
-        # FLUP 系列：数字段整体保留
-        ("FLUP11201", "FLUP-11201"),
-        ("FLUP113730", "FLUP-113730"),
-        ("FLUP1122285", "FLUP-1122285"),
         # 小写厂牌
         ("xfxfz14468", "xfxfz-14468"),
         ("dvdms00300a", "dvdms-00300a"),
@@ -55,6 +51,69 @@ def test_normalize(ruleset, original, expected):
     item = plan_for(ruleset, original)
     assert item.target == expected, f"{original} -> {item.target}（期望 {expected}）"
     assert item.action is Action.RENAME
+
+
+@pytest.mark.parametrize(
+    "original",
+    [
+        # FLUP 是国产内容的编号，不是日本番号 —— 不该被套番号规范
+        "FLUP11201",
+        "FLUP113730",
+        "FLUP1122285",
+        "FLUP-1131428",
+        "FLUP11223-2",
+        "FLUP-11223 (2)",
+    ],
+)
+def test_domestic_prefix_is_not_a_code(ruleset, original):
+    """命中排除名单的国产编号必须被跳过，不能当番号改名。"""
+    item = plan_for(ruleset, original)
+    assert item.action is Action.SKIP, f"{original} 不该被改名"
+    assert item.target == original
+    assert item.base == ""
+
+
+@pytest.mark.parametrize(
+    "original,expected",
+    [
+        # 规范名必须能反解回自己（幂等）—— 否则第二次跑 rename 会改坏目录
+        ("DOW-240706-24", "DOW-240706-24"),
+        ("7K-240423-01", "7K-240423-01"),
+        ("TEA-240806-13", "TEA-240806-13"),
+        ("xfxfz-14681", "xfxfz-14681"),
+        ("sdmu-00877b", "sdmu-00877b"),
+        ("SVDVD-840 (1)", "SVDVD-840 (1)"),
+        ("MAAN-961", "MAAN-961"),
+        ("SDMM-030BC", "SDMM-030BC"),
+        ("CLT-013C", "CLT-013C"),
+        ("FC2-PPV-2549115", "FC2-PPV-2549115"),
+        ("avop-235-C", "avop-235-C"),
+    ],
+)
+def test_canonical_name_is_idempotent(ruleset, original, expected):
+    """已经规范的目录再跑一次 rename 必须保持 KEEP。"""
+    item = plan_for(ruleset, original)
+    assert item.target == expected, f"{original} -> {item.target}（期望 {expected}）"
+    assert item.action is Action.KEEP, f"{original} 不该被再次改名"
+
+
+def test_optional_group_is_not_rendered_as_none(ruleset):
+    """没参与匹配的可选分组是 None，不能渲染成字符串 "None"。"""
+    item = plan_for(ruleset, "xfxfz-14681")
+    assert item.target == "xfxfz-14681"
+    assert "None" not in item.target
+
+
+def test_hyphen_duplicate_strip_does_not_override_correct_parse(ruleset):
+    """基准已经能正确解析时，条件剥离不得用错误结果覆盖它。
+
+    `DOW-240706-24` 本身就该被日期型规则解析成 `DOW-240706-24`；
+    剥掉 `-24` 后剩下的 `DOW-240706` 会被「厂牌-数字」规则抢先匹配，
+    变成错误的 `DOW-240706 (24)`。
+    """
+    item = plan_for(ruleset, "DOW-240706-24")
+    assert item.target == "DOW-240706-24"
+    assert item.action is Action.KEEP
 
 
 @pytest.mark.parametrize(
@@ -82,7 +141,6 @@ def test_already_normalized_is_kept(ruleset, original, expected):
         ("SDMM030AC(1)", "SDMM-030AC (1)"),
         ("SDMM076(1)", "SDMM-076 (1)"),
         ("TEA24080824 2", "TEA-240808-24 (2)"),
-        ("FLUP11223-2", "FLUP-11223 (2)"),
         ("HEA24060902-2", "HEA-240609-02 (2)"),
         # 域名里带 (N) 的副本
         ("aavv38(1).xyz@DVMM055A", "DVMM-055A (1)"),

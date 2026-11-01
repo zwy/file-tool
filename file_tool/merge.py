@@ -293,7 +293,7 @@ def _resolve_base(
     """
     core, captured = engine_mod.strip_noise(name, ruleset.preprocess)
     base, _target, _rule, _desc, _core = engine_mod.resolve_target(
-        core, captured, ordered, ruleset.preprocess, dup_sources
+        core, captured, ordered, ruleset.preprocess, dup_sources, ruleset.exclude
     )
     if base:
         return base
@@ -306,7 +306,7 @@ def _resolve_base(
 
     core2, captured2 = engine_mod.strip_noise(stripped, ruleset.preprocess)
     base2, _t, _r, _d, _c = engine_mod.resolve_target(
-        core2, captured2, ordered, ruleset.preprocess, dup_sources
+        core2, captured2, ordered, ruleset.preprocess, dup_sources, ruleset.exclude
     )
     return base2 or ""
 

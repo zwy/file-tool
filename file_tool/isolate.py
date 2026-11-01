@@ -138,8 +138,22 @@ def judge_directory(
     ordered = ruleset.ordered_matches()
     dup_sources = ruleset.dup_sources or ["dup"]
     core, captured = engine.strip_noise(name, ruleset.preprocess)
+
+    # 命中排除名单 -> 整类目录都不是番号内容，直接挪走，不再下探内容。
+    # 这一步必须放在内容判定之前：国产目录里全是原始导出名
+    # （``image_2023`` / ``photo_2023`` / ``IMG_7847`` / ``dw9358``），
+    # 宽松的番号正则会把它们误认成番号，导致国产内容被留在番号库里。
+    if ruleset.is_excluded(core):
+        files = [
+            p for p in directory.rglob("*")
+            if p.is_file() and not p.name.startswith("._")
+        ]
+        item.isolation = Isolation.MOVE
+        item.reason = f"命中排除名单（非番号形态，{len(files)} 个文件）"
+        return item
+
     base, _target, _rule, _desc, _core = engine.resolve_target(
-        core, captured, ordered, ruleset.preprocess, dup_sources
+        core, captured, ordered, ruleset.preprocess, dup_sources, ruleset.exclude
     )
     if base:
         item.isolation = Isolation.KEEP

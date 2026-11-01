@@ -102,13 +102,20 @@ def _apply_one(
 
 
 def _render(template: str, values: Dict[str, str]) -> str:
-    """回填模板；未提供的占位符留空，不抛异常。"""
+    """回填模板；未提供的占位符留空，不抛异常。
+
+    注意 ``None`` 也要当空串处理：正则里没参与匹配的**可选分组**取值是
+    ``None``（如 ``(?P<ver>-[A-Z]{1,3})?`` 在 ``xfxfz-14681`` 上没匹配上），
+    直接渲染会得到字符串 ``"None"``，把 ``xfxfz-14681`` 变成
+    ``xfxfz-14681None``。
+    """
 
     class _Safe(dict):
         def __missing__(self, key: str) -> str:  # noqa: D105
             return ""
 
-    return template.format_map(_Safe(values))
+    safe = _Safe({k: ("" if v is None else v) for k, v in values.items()})
+    return template.format_map(safe)
 
 
 def _match_core(
@@ -156,6 +163,7 @@ def resolve_target(
     matches: Sequence[MatchRule],
     preprocess: Sequence[PreprocessRule] = (),
     dup_sources: Sequence[str] = ("dup",),
+    exclude: Sequence[str] = (),
 ) -> Tuple[Optional[str], str, str, str, str]:
     """在核心串上匹配番号规则。
 
@@ -163,32 +171,47 @@ def resolve_target(
 
     基础名不含重复副本标记，是「同一作品」的判定键，merge 阶段靠它分组。
 
+    ``exclude`` 是永不视为番号的名称形态（见 :attr:`RuleSet.exclude`）。
+    命中时直接返回「不匹配」—— 国产内容的编号（如 ``FLUP-1131428``）
+    因此不会被套上番号规范。
+
     条件剥离规则的判定逻辑：
-    对每条条件规则，尝试剥掉它；如果剥掉后能匹配到番号规则，
-    而**不剥**时匹配不到（或匹配结果不同），就采纳这次剥离。
+    **只有在基准匹配不上时才尝试条件剥离** —— 否则剥离结果会覆盖掉正确的解析，
+    把已经规范的目录改坏（详见下方注释）。
     这样 ``DOW24072205-2`` 会剥掉 ``-2``，而 ``MAAN-961`` 保持原样。
     """
+    # 排除名单优先于一切匹配：国产内容的编号不该被套番号规范
+    if exclude and any(re.search(pattern, core) for pattern in exclude):
+        return None, "", "", "命中排除名单（非番号形态）", core
+
     baseline = _match_core(core, captured, matches, dup_sources)
 
-    best = baseline
-    for rule in preprocess:
-        if not rule.conditional:
-            continue
-        attempt = _apply_one(core, rule)
-        if attempt is None:
-            continue
-        new_core, value = attempt
-        new_captured = dict(captured)
-        if rule.capture and value:
-            new_captured[rule.capture] = value
-        candidate = _match_core(new_core, new_captured, matches, dup_sources)
-        if candidate is None:
-            continue
-        # 剥掉之后能匹配、且匹配结果与不剥不同 → 采纳
-        if baseline is None or candidate[1] != baseline[1]:
+    # 条件剥离**只在基准匹配不上时才尝试**。
+    # 这是关键：`DOW-240706-24` 本身就能被日期型规则正确解析，
+    # 而剥掉尾部 `-24` 后剩下的 `DOW-240706` 会被「厂牌-数字」规则抢先匹配，
+    # 得到一个错误的结果 `DOW-240706 (24)` —— 规范名会在第二次运行时被改坏。
+    #
+    # `MAAN-961` 与 `DOW24072205-2` 的区分不依赖这条：
+    # 前者剥掉 `-961` 后剩下 `MAAN` 匹配不上任何规则，剥离自然被拒绝；
+    # 后者基准本来就匹配不上，剥离才有机会生效。
+    if baseline is None:
+        for rule in preprocess:
+            if not rule.conditional:
+                continue
+            attempt = _apply_one(core, rule)
+            if attempt is None:
+                continue
+            new_core, value = attempt
+            new_captured = dict(captured)
+            if rule.capture and value:
+                new_captured[rule.capture] = value
+            candidate = _match_core(new_core, new_captured, matches, dup_sources)
+            if candidate is None:
+                continue
             core = new_core
             captured = new_captured
             baseline = candidate
+            break
 
     if baseline is None:
         return None, "", "", "", core
@@ -215,7 +238,7 @@ def build_plan(
     for name in names:
         core, captured = strip_noise(name, ruleset.preprocess)
         base, target, rule_name, desc, final_core = resolve_target(
-            core, captured, ordered, ruleset.preprocess, dup_sources
+            core, captured, ordered, ruleset.preprocess, dup_sources, ruleset.exclude
         )
 
         if not target:
