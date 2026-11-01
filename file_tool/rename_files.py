@@ -172,6 +172,42 @@ def _resolve(name: str, ruleset: RuleSet):
 _NOISE_SEPARATORS = re.compile(r"[._~@\- ]")
 
 
+def _cut_search(stem: str, ruleset: RuleSet):
+    """逐段截断，找出「番号 + 噪声后缀」的切分。
+
+    切分点取在分隔符**之前**（分隔符归后缀）。切点从**后往前**试 ——
+    长的前缀优先：番号前缀越长越具体，``START-589-U`` 应该整体算一个番号，
+    而不是 ``START-589`` 加一条尾巴。
+
+    但如果更短的切点解析出**同一个**番号，说明多出来的那截是被规则当成
+    噪声剥掉的（``-2`` 这种分段标记）—— 那就该用短的那个，让标记留在
+    后缀里，而不是被吞掉。
+
+    遇到**另一个**番号就停：再往前切已经是另一部片子了。
+
+    返回 (番号基础名, 噪声后缀, 规则名)；解析不出返回 (None, "", "")。
+    """
+    cuts = sorted({m.start() for m in _NOISE_SEPARATORS.finditer(stem)}, reverse=True)
+    best: tuple = (None, "", "")
+    for cut in cuts:
+        head, tail = stem[:cut], stem[cut:]
+        if not head:
+            continue
+        base, _target, rule = _resolve(head, ruleset)
+        if not base:
+            continue
+        if best[0] is None:
+            best = (base, tail, rule)
+            continue
+        if canonical_code(base) == canonical_code(best[0]):
+            # 同一部片子 —— 用更短的切点，把被剥掉的标记留到后缀里
+            best = (base, tail, rule)
+            continue
+        # 另一部片子 —— 长的那个才是对的
+        break
+    return best
+
+
 def split_code_suffix(stem: str, ruleset: RuleSet):
     """在文件名里找出「番号 + 噪声后缀」的切分。
 
@@ -190,21 +226,34 @@ def split_code_suffix(stem: str, ruleset: RuleSet):
     前缀能解析成番号就用。噪声后缀**原样保留** —— 语言标记是有意义的信息，
     删掉就毁了。
 
+    **两路解析取长补短**
+    ------------------
+    整串解析（``_resolve(stem)``）和逐段截断各算一遍：
+
+    - 两者指向**同一部片子**时，取逐段截断的结果。
+      这是关键 —— ``sdjs-361-2.mp4`` 里的 ``-2`` 会被
+      ``strip_hyphen_dup`` 规则当成「重复副本标记」剥掉，整串解析
+      只剩 ``sdjs-361``；而截断解析切成 ``sdjs-361`` + ``-2``，
+      ``-2`` 这个分段标记就留在了文件名里。
+      不做这一步，``4k2.me@sdjs-361-2.mp4`` 会被算成 ``sdjs-361.mp4``
+      —— 跟已有的真身撞名，然后被当成「别的番号」跳过，水印永远去不掉。
+    - 两者指向**不同**的片子时，取整串解析的结果。
+      ``ABF-292-AI`` 整串解析是 ``ABF-292-AI``，截断却是 ``ABF-292``
+      —— 截断结果更短但不是同一部片子，按截断来会拼出
+      ``ABF-292-AI-AI.mp4`` 这种重复后缀。
+
     返回 (番号基础名, 噪声后缀, 规则名)；解析不出返回 (None, "", "")。
     """
-    base, _target, rule = _resolve(stem, ruleset)
-    if base:
-        return base, "", rule
+    whole_base, _whole_target, whole_rule = _resolve(stem, ruleset)
+    cut_base, cut_tail, cut_rule = _cut_search(stem, ruleset)
 
-    # 切分点取在分隔符**之前**（分隔符归后缀），长的前缀优先
-    cuts = sorted({m.start() for m in _NOISE_SEPARATORS.finditer(stem)}, reverse=True)
-    for cut in cuts:
-        head, tail = stem[:cut], stem[cut:]
-        if not head:
-            continue
-        base, _target, rule = _resolve(head, ruleset)
-        if base:
-            return base, tail, rule
+    if whole_base:
+        if cut_base and canonical_code(cut_base) == canonical_code(whole_base):
+            # 同一部分片 —— 取截断结果，让被剥掉的标记留在后缀里
+            return cut_base, cut_tail, cut_rule
+        return whole_base, "", whole_rule
+    if cut_base:
+        return cut_base, cut_tail, cut_rule
     return None, "", ""
 
 
@@ -245,11 +294,56 @@ def build_file_plan(root: Path, ruleset: RuleSet) -> FilePlan:
             item = FileItem(relpath=relpath, directory=child.name, original=path.name)
 
             if canonical_code(file_base) != canonical_code(dir_base):
-                # 不是同一部番号 —— 判定不动
-                item.action = FileAction.SKIP
-                item.reason = f"文件名是别的番号（{file_base}），不动"
+                # 不是同一部番号 —— **不能**套目录的番号。
+                #
+                # 那个名字本身就是内容标识：``OFJE-594-A.mp4`` 一眼就认得出
+                # 是 A 变体，套上目录的番号 ``OFJE-594`` 会把变体信息抹掉。
+                #
+                # 但「不动」不等于「不规范化」：文件名里带的水印域名是
+                # **纯噪声**，跟内容标识无关。所以这里用**文件自己的番号**
+                # 来规范化 —— 水印剥掉，番号本身也规范化成厂牌-序号，
+                # 变体后缀原样保留。
+                #
+                # 实测踩过的坑：H 盘 ``DVDMS-980/`` 里放的是 A/B 两个变体，
+                # 文件名是 ``hhd800.com@DVDMS-980-A.mp4``。旧逻辑整个文件
+                # 不动，水印一直留着 —— 「文件名规范化」就差这么一步。
+                new_name = file_base + noise + ext
+                if new_name == path.name:
+                    item.target = new_name
+                    item.action = FileAction.KEEP
+                    item.reason = "已是规范名"
+                    plan.items.append(item)
+                    continue
+
+                dst_path = path.parent / new_name
+                if dst_path.exists():
+                    if _is_same_file(path, dst_path):
+                        # 同一个文件，仅大小写不同 —— 不是冲突
+                        item.target = new_name
+                        item.action = FileAction.RENAME
+                        item.reason = "仅大小写不同"
+                        plan.items.append(item)
+                        continue
+                    item.target = new_name
+                    item.action = FileAction.CONFLICT
+                    item.reason = "目标名已存在，未覆盖"
+                    plan.items.append(item)
+                    continue
+
+                item.target = new_name
+                item.action = FileAction.RENAME
+                item.reason = f"文件名是别的番号（{file_base}），按它自己的番号规范化"
                 plan.items.append(item)
                 continue
+
+            # 目录名自带的重复标记（如 ``CLUB-880 (2)``）已经体现在
+            # ``dir_target`` 里了。文件名里的同一个标记不能再加一遍 ——
+            # 否则会拼出 ``CLUB-880 (2) (2).mp4`` 这种重复后缀。
+            # 目录没有标记时（``sdjs-361``），文件自己的分段标记
+            # （``-2``）要留着 —— 那是区分不同分段的唯一信息。
+            dir_marker = dir_target[len(dir_base):] if dir_target.startswith(dir_base) else ""
+            if dir_marker and noise.startswith(dir_marker):
+                noise = noise[len(dir_marker):]
 
             new_name = dir_target + noise + ext
             if new_name == path.name:

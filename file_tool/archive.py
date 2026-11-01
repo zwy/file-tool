@@ -26,19 +26,41 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
 from pydantic import BaseModel, Field
 
+from file_tool import engine
 from file_tool import fscompat
 
 # 已知媒体扩展名。只有这些文件参与分装，其他文件原地保留。
 MEDIA_EXTENSIONS = {
     ".mp4", ".mpg", ".mpeg", ".avi", ".wmv", ".mov", ".mkv", ".flv", ".ts",
     ".jpg", ".jpeg", ".png", ".webp", ".bmp",
+    # 字幕必须跟着视频走。字幕留在顶层会有两个后果：视频进了目录、
+    # 字幕还在外面，字幕与视频分离；而且带水印的字幕名
+    # （hhd800.com@DVDMS-977.ja.srt）永远规范化不掉。
+    ".srt", ".ass", ".ssa", ".sub", ".vtt", ".smi",
 }
+
+# 下载站水印域名前缀，如 hhd800.com@DVDMS-977。
+#
+# TLD 白名单只有 engine.py 一处，这里直接复用，不另抄一份 ——
+# 抄第二份迟早会漏，而漏一个就意味着这一种域名认不出来。
+_DOMAIN_PREFIX_RE = re.compile(
+    r"^(?:[A-Za-z0-9._()\-]+\.(?:" + "|".join(engine.WATERMARK_TLDS) + r"))@"
+)
+
+# 文件名里可作为切分点的分隔符 —— 「番号 + 噪声后缀」的候选切点。
+_SPLIT_CHARS = "._~@-"
+
+# 番号本体：厂牌 + 序号（可带横杠），末尾可有 1~2 位版本字母。
+_CODE_RE = re.compile(
+    r"(?P<studio>[A-Za-z]{2,6})[-_]?(?P<num>\d{2,5})(?P<ver>[A-Za-z]{1,2})?"
+)
 
 
 class ArchiveItem(BaseModel):
@@ -123,15 +145,29 @@ def normalize_key(stem: str) -> Optional[str]:
 
     ``CLUB810`` / ``CLUB-810`` -> ``CLUB-810``
     ``CLUB830C`` / ``CLUB830``  -> ``CLUB-830``（``C`` 是字幕版标记，剥掉）
+    ``hhd800.com@DVDMS-977``    -> ``DVDMS-977``（剥掉下载站水印域名）
+    ``hhd800.com@DVDMS-977.ja`` -> ``DVDMS-977``（再剥掉语言标记后缀）
 
     返回 None 表示无法识别。
-    """
-    import re
 
-    m = re.fullmatch(r"(?P<studio>[A-Za-z]{2,6})[-_]?(?P<num>\d{2,5})(?P<ver>[A-Za-z]{1,2})?", stem)
-    if not m:
-        return None
-    return f"{m.group('studio')}-{m.group('num')}"
+    实测踩过的坑：H 盘顶层平铺着 ``hhd800.com@DVDMS-977.mp4`` 这种
+    带水印域名的文件。旧实现直接拿整串去 fullmatch 番号形态，域名前缀
+    让它匹配不上 —— 文件被判成「不认识的非媒体文件」原地保留，
+    于是它永远分不进番号目录，带水印的名字也永远规范化不掉。
+    """
+    core = _DOMAIN_PREFIX_RE.sub("", stem)
+
+    # 逐段截断试解析：番号后面挂的噪声后缀（语言标记、画质标记）不算番号。
+    # 长的前缀优先 —— 先试整串，再从分隔符处一截一截往前试。
+    cuts = sorted({i for i, ch in enumerate(core) if ch in _SPLIT_CHARS}, reverse=True)
+    for cut in [len(core)] + cuts:
+        head = core[:cut]
+        if not head:
+            continue
+        m = _CODE_RE.fullmatch(head)
+        if m:
+            return f"{m.group('studio')}-{m.group('num')}"
+    return None
 
 
 def is_fork(name: str) -> bool:

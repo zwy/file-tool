@@ -48,9 +48,16 @@ from file_tool import fscompat
 from file_tool.models import RuleSet
 
 # 番号形态：厂牌字母 + 数字（可带横杠），如 ABP-001、AV-20608、SDMM028C
+#
+# 末尾要允许**版本后缀字母**（START-489V / START-589-U 里的 V / U）。
+# 实测踩过的坑：H 盘的 ``第一會所新片@SIS001@START-489V`` 目录里只有
+# ``START-489V.mp4`` 一个文件，而旧正则要求数字后面紧跟非字母数字，
+# ``V`` 挡住了匹配 —— 目录名解析不出番号、目录内文件名也认不出番号，
+# 两道判定同时失手，这个**真番号目录**就被当成国产内容挪进了 GC。
 CODE_IN_NAME = re.compile(
     r"(?<![A-Za-z0-9])"          # 左边不是字母数字
     r"[A-Za-z]{2,6}[-_]?\d{3,6}"  # 厂牌 + 序号
+    r"[A-Za-z]{0,3}"             # 版本后缀（START-489V 的 V）
     r"(?![A-Za-z0-9])"           # 右边不是字母数字
 )
 

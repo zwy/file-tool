@@ -84,20 +84,20 @@ def test_tidy_rename_step_only_touches_directories(ruleset, tmp_path):
     规划阶段用「只含目录」的名单，执行阶段也必须用同一份 ——
     两边不一致的话，顶层恰好叫番号的散文件会被误改。
 
-    用 ``.srt`` 而不是 ``.mp4``：媒体文件会被 archive 步骤分装进新目录，
-    根本走不到 rename 步骤，测不到这个不一致。
+    用 ``.txt`` 而不是 ``.mp4`` / ``.srt``：这两种扩展名都会被 archive
+    步骤分装进新目录，根本走不到 rename 步骤，测不到这个不一致。
     """
     touch(tmp_path, "SDMM028C/a.mp4")
     # 顶层散文件，名字恰好像番号，但不是媒体扩展名 -> archive 不碰它
-    touch(tmp_path, "MIDE004.srt")
+    touch(tmp_path, "MIDE004.txt")
 
     plan = tidy_mod.build_tidy_plan(tmp_path, ruleset)
     result = tidy_mod.apply_tidy_plan(tmp_path, ruleset, plan)
 
     assert result["renamed"] == 1
     # 散文件原地不动，没被当成目录改名
-    assert (tmp_path / "MIDE004.srt").exists()
-    assert not (tmp_path / "MIDE-004.srt").exists()
+    assert (tmp_path / "MIDE004.txt").exists()
+    assert not (tmp_path / "MIDE-004.txt").exists()
 
 
 # --------------------------------------------------------------------------
@@ -174,12 +174,19 @@ def test_file_with_noise_suffix_is_renamed(ruleset, tmp_path):
     assert plan.rename_items[0].target == "FCT-043_en.srt"
 
 
-def test_genuinely_different_code_is_still_skipped(ruleset, tmp_path):
-    """真的是别的番号，仍然不动 —— 不能放宽过头。"""
+def test_genuinely_different_code_keeps_its_own_code(ruleset, tmp_path):
+    """真的是别的番号 -> 按**它自己的**番号规范化，不套目录的番号。
+
+    ``STSK-108A`` 是另一部作品（目录 ``STSK-108`` 里混进来的 A 变体）。
+    套目录的番号会把变体信息抹掉；但水印域名是纯噪声，该剥掉，
+    番号本身也该规范成厂牌-序号 —— 所以是改名，不是跳过。
+    """
     (tmp_path / "STSK-108").mkdir()
     (tmp_path / "STSK-108" / "aavv38.xyz@STSK108A.mp4").write_bytes(b"x")
 
     plan = rf.build_file_plan(tmp_path, ruleset)
 
-    assert plan.rename_items == []
-    assert len(plan.skip_items) == 1
+    assert len(plan.rename_items) == 1
+    # 关键：不能是 STSK-108.mp4 —— 那会把 A 变体信息抹掉
+    assert plan.rename_items[0].target == "STSK-108A.mp4"
+    assert plan.skip_items == []

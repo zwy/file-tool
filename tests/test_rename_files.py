@@ -74,13 +74,29 @@ def test_already_normalized_is_kept(tmp_path, ruleset):
     assert item.action is rf.FileAction.KEEP
 
 
-def test_different_code_is_not_touched(tmp_path, ruleset):
-    """文件名是别的番号 -> 判定不动，不进改名。"""
+def test_different_code_keeps_its_own_code(tmp_path, ruleset):
+    """文件名是别的番号 -> 按它自己的番号规范化，不套目录的番号。
+
+    ``STSK-108A`` 是另一部作品（目录 ``STSK-108`` 里混进来的 A 变体）。
+    套目录的番号会把变体信息抹掉；但水印域名是纯噪声，该剥掉，
+    番号本身也该规范成厂牌-序号。
+    """
     make(tmp_path, "STSK-108/aavv38.xyz@STSK108A.mp4")
     plan = plan_for(tmp_path, ruleset)
     item = find(plan, "STSK-108/aavv38.xyz@STSK108A.mp4")
-    assert item.action is rf.FileAction.SKIP
-    assert item.target == ""
+    assert item.action is rf.FileAction.RENAME
+    # 关键：不能是 STSK-108.mp4 —— 那会把 A 变体信息抹掉
+    assert item.target == "STSK-108A.mp4"
+
+
+def test_different_code_conflict_is_never_overwritten(tmp_path, ruleset):
+    """别的番号的文件剥掉水印后撞上已有文件 -> 报冲突，绝不覆盖。"""
+    make(tmp_path, "STSK-108/aavv38.xyz@STSK108A.mp4")
+    make(tmp_path, "STSK-108/STSK-108A.mp4")
+    plan = plan_for(tmp_path, ruleset)
+    item = find(plan, "STSK-108/aavv38.xyz@STSK108A.mp4")
+    assert item.action is rf.FileAction.CONFLICT
+    assert item.target == "STSK-108A.mp4"
 
 
 def test_file_without_code_is_left_alone(tmp_path, ruleset):
