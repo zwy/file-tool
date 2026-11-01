@@ -61,6 +61,28 @@ CODE_IN_NAME = re.compile(
     r"(?![A-Za-z0-9])"           # 右边不是字母数字
 )
 
+# 名字里含中日韩字符 -> 不算番号形态。
+#
+# 实测踩过的坑：国产站爱给内容套一个番号形态的码（SATM-035 / DMX-0067 /
+# AH-001 / BOI096…），而且是塞在**中文标题里** ——
+# 「【AI增强】SATM-035美少女模特为了凑医药费出卖肉体.mp4」。
+# 旧判定只看「名字里有没有番号形态的片段」，于是这批国产目录全被判成
+# 「含番号的合集目录」留在原地 —— 国产内容就这么卡在番号库里，隔离不出去。
+#
+# 真番号的文件名是纯 ASCII（``ABP-001.mp4`` / ``489155.com@CLUB-925.mp4``）。
+# 实测 F / G / H 三个番号库，番号形态的命中名**没有一个含中日韩字符**
+# （372 / 417 / 306 条命中，含 CJK 的 0 条）—— 所以这条收紧对番号库零影响，
+# 只摘掉国产内容。
+CJK_IN_NAME = re.compile(
+    "["
+    "\u3000-\u30ff"   # CJK 标点 / 平假名 / 片假名
+    "\u3400-\u4dbf"   # CJK 扩展 A
+    "\u4e00-\u9fff"   # CJK 基本区
+    "\uf900-\ufaff"   # CJK 兼容表意文字
+    "\uff00-\uffef"   # 全角形式
+    "]"
+)
+
 # 相机 / 手机 / 相册软件的原始导出名 —— 它们长得像番号，但不是番号。
 #
 # 实测踩过的坑：国产合集目录 ``322`` 里全是 ``IMG_6481.jpg`` /
@@ -78,6 +100,10 @@ _EXPORT_NAME_PREFIXES = (
     # 厂牌段只有 2 个字母的导出名 —— 正则的厂牌段下限就是 2，
     # 所以 dw 这类必须单独列出来。
     "dw",
+    # 扫描件 / 相册导出名 —— Page0000.jpg 这类。
+    # 实测国产相册目录里全是 Page0000.jpg ~ Page0027.jpg，
+    # 不排掉的话整个目录会被判成「含番号」而留在番号库里。
+    "page",
 )
 
 
@@ -149,14 +175,44 @@ class IsolationPlan(BaseModel):
         }
 
 
-def find_codes_in_dir(directory: Path, limit: int = 5) -> List[str]:
+def _code_from_cjk_dir_name(path: Path, ruleset: Optional[RuleSet]) -> str:
+    """含中日韩字符的**子目录名**里有没有番号。
+
+    下载站会给目录起「第一會所新片@SIS001@CLUB-936」这种复合名 ——
+    名字带中文，但确实是番号。这种命名只出现在**目录名**上
+    （文件不会这么起名），所以文件一律不查。
+
+    查了才不会把合集目录里的真番号漏掉：收紧「含中日韩字符不算番号」
+    之后，只有这里能兜住这一类证据。
+    """
+    if ruleset is None or not path.is_dir():
+        return ""
+    core, captured = engine.strip_noise(path.name, ruleset.preprocess)
+    base, _target, _rule, _desc, _core = engine.resolve_target(
+        core, captured, ruleset.ordered_matches(), ruleset.preprocess,
+        ruleset.dup_sources or ["dup"], ruleset.exclude,
+    )
+    return base or ""
+
+
+def find_codes_in_dir(
+    directory: Path,
+    limit: int = 5,
+    ruleset: Optional[RuleSet] = None,
+) -> List[str]:
     """在目录（含子目录）里找出番号形态的文件名。
 
     只看**文件名**和**目录名**，不看文件内容 —— 内容扫描代价太高，
     而番号几乎总是出现在文件名里。
 
-    原始导出名（``IMG_6481`` / ``photo_2023``）会被排除 ——
-    它们长得像番号但不是番号，见 :func:`_is_export_name`。
+    两种名字不算番号形态：
+
+    - 原始导出名（``IMG_6481`` / ``photo_2023`` / ``Page0000``）——
+      它们长得像番号但不是番号，见 :func:`_is_export_name`。
+    - **名字里含中日韩字符**的 —— 国产站把番号形态的码塞在中文标题里，
+      那是伪装不是番号，见 :data:`CJK_IN_NAME`。
+      含中日韩字符的**子目录名**是例外，交给规则集再判一次，
+      见 :func:`_code_from_cjk_dir_name`。
     """
     found: List[str] = []
     seen = set()
@@ -164,17 +220,27 @@ def find_codes_in_dir(directory: Path, limit: int = 5) -> List[str]:
     for path in sorted(directory.rglob("*")):
         if path.name.startswith("._"):
             continue
-        for text in (path.name,):
-            for match in CODE_IN_NAME.finditer(text):
-                code = match.group(0)
-                if code in seen:
-                    continue
-                if _is_export_name(code):
-                    continue
+        if CJK_IN_NAME.search(path.name):
+            # 「【AI增强】SATM-035美少女模特….mp4」「…XueNi-888】…」——
+            # 番号形态的码嵌在中文标题里，这是国产内容的伪装，不是番号。
+            # 真番号的文件名是纯 ASCII。
+            code = _code_from_cjk_dir_name(path, ruleset)
+            if code and code not in seen:
                 seen.add(code)
                 found.append(code)
                 if len(found) >= limit:
                     return found
+            continue
+        for match in CODE_IN_NAME.finditer(path.name):
+            code = match.group(0)
+            if code in seen:
+                continue
+            if _is_export_name(code):
+                continue
+            seen.add(code)
+            found.append(code)
+            if len(found) >= limit:
+                return found
     return found
 
 
@@ -214,7 +280,7 @@ def judge_directory(
         item.reason = "目录名是番号"
         return item
 
-    codes = find_codes_in_dir(directory)
+    codes = find_codes_in_dir(directory, ruleset=ruleset)
     if codes:
         item.isolation = Isolation.KEEP
         item.code_samples = codes
