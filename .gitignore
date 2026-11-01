@@ -1,0 +1,25 @@
+# 依赖
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# 构建产物
+build/
+dist/
+
+# 测试与缓存
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 编辑器与系统
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# 本地规则覆盖（可能含个人路径或私有规则）
+rules/local*.yaml

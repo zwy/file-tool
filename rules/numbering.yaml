@@ -1,0 +1,114 @@
+# 番号目录改名规则集
+#
+# 结构：
+#   preprocess  —— 噪声剥离（与番号知识无关）
+#   matches     —— 番号匹配（领域知识），按 priority 从高到低尝试
+#
+# 合成语义：
+#   template    —— 用命名分组回填规范名；{raw} = 剥离后的核心串
+#   dup_suffix  —— 重复副本标记的回贴方式；{dup} = 剥离出的标记序号
+#
+# 设计约定：厂牌与数字之间统一用「-」分隔，版本后缀（���如 C / CX / AC）原样保留在末尾。
+
+version: 1
+description: "日本成人影片（番号）目录名规范化：去水印域名、去重复标记、统一 厂牌-数字 格式"
+
+preprocess:
+  # 注意顺序：先捕获「域名里带 (N)」的副本标记，再剥域名。
+  # 剥完域名后 (N) 已经不在串里，就再也捕不到了。
+  - name: capture_watermark_dup
+    description: "域名里带 (N) 的水印副本，如 aavv38(1).xyz@DVMM055A —— 记录 N 供回贴，避免与主目录撞名"
+    pattern: '^[A-Za-z0-9._\-]*\((?P<wdup>\d+)\)\.[A-Za-z]{2,}@'
+    capture: wdup
+
+  - name: strip_watermark_domain
+    description: "剥掉前缀水印域名，如 aavv38.xyz@SDMM028 -> SDMM028"
+    pattern: '^(?P<domain>[A-Za-z0-9._()\-]+\.(?:com|net|org|xyz|cc|tv|me|info|top|club|shop|wang|live|site|space|pw|fun|icu|vip))@'
+    capture: domain
+
+  - name: strip_paren_dup
+    description: "剥掉尾部重复副本标记 (1)"
+    pattern: '\((?P<dup>\d+)\)$'
+    capture: dup
+    conditional: true
+
+  - name: strip_space_dup
+    description: "剥掉尾部空格+数字重复标记 ' 2'"
+    pattern: ' (?P<dup>\d+)$'
+    capture: dup
+    conditional: true
+
+  - name: strip_hyphen_dup
+    description: "剥掉尾部连字符+数字重复标记 -2（仅当剥完仍是合法番号才剥）"
+    pattern: '-(?P<dup>\d+)$'
+    capture: dup
+    conditional: true
+
+  - name: strip_hd_prefix
+    description: "剥掉 HD_ 前缀"
+    pattern: '^HD_'
+
+matches:
+  # ---- 日期型：厂牌 + YYMMDD + 序号，如 DOW24070403 / 7K24042301 ----
+  - name: date_style
+    description: "日期型番号 DOW24070403 / TEA24080208 / 7K24042301"
+    pattern: '^(?P<studio>[A-Z]{2,6}|[0-9]K)(?P<date>\d{6})(?P<seq>\d{2})$'
+    template: '{studio}-{date}-{seq}'
+    dup_suffix: ' ({dup})'
+    priority: 100
+
+  # ---- FC2 专属格式 ----
+  - name: fc2
+    description: "FC2 专属格式 FC2-PPV-4329956"
+    pattern: '^FC2-PPV-(?P<num>\d{5,8})$'
+    template: '{raw}'
+    dup_suffix: ' ({dup})'
+    priority: 95
+
+  # ---- 厂牌-数字（带横杠），如 MAAN-961 / IPZZ-118C / SSIS-863C ----
+  - name: studio_dash_num
+    description: "厂牌-序号形 MAAN-961 / IPZZ-118C / SSIS-863C"
+    pattern: '^(?P<studio>[A-Z]{2,6})-(?P<num>\d{2,6})(?P<ver>[A-Z]{0,3})$'
+    template: '{studio}-{num}{ver}'
+    dup_suffix: ' ({dup})'
+    priority: 90
+
+  # ---- 数字前缀 + 厂牌-数字，如 230ORECO-640CX / 107MMGH-313 ----
+  - name: prefix_num_studio
+    description: "带数字前缀 230ORECO-640CX / 107MMGH-313"
+    pattern: '^(?P<prefix>\d{2,4})(?P<studio>[A-Z]{3,6})-(?P<num>\d{2,6})(?P<ver>[A-Z]{0,3})$'
+    template: '{studio}-{num}{ver}'
+    dup_suffix: ' ({dup})'
+    priority: 85
+
+  # ---- 厂牌+数字（无横杠），如 SDMM028C / MON004 / CAWD660CX ----
+  - name: studio_num_ver
+    description: "厂牌序号形 SDMM028C / MON004 / CAWD660CX"
+    pattern: '^(?P<studio>[A-Z]{2,6})(?P<num>\d{2,5})(?P<ver>[A-Z]{0,3})$'
+    template: '{studio}-{num}{ver}'
+    dup_suffix: ' ({dup})'
+    priority: 80
+
+  # ---- FLUP 系列：厂牌 + 变长数字（112/113 系列 + 2~5 位序号） ----
+  - name: flup
+    description: "FLUP 系列 FLUP11201 / FLUP113730 / FLUP1122285（数字段整体保留，不臆测拆分）"
+    pattern: '^(?P<studio>FLUP)(?P<num>\d{5,7})$'
+    template: '{studio}-{num}'
+    dup_suffix: ' ({dup})'
+    priority: 75
+
+  # ---- 小写厂牌带横杠，如 avop-235-C ----
+  - name: lower_dash
+    description: "小写厂牌带横杠 avop-235-C"
+    pattern: '^(?P<studio>[a-z]{3,8})-(?P<num>\d{1,6})(?P<ver>-[A-Z]{1,3})?$'
+    template: '{studio}-{num}{ver}'
+    dup_suffix: ' ({dup})'
+    priority: 70
+
+  # ---- 小写厂牌 + 数字（可带小写版本后缀），如 xfxfz14468 / dvdms00300a ----
+  - name: lower_code
+    description: "小写厂牌序号形 xfxfz14468 / dvdms00300a / sdmu00877b"
+    pattern: '^(?P<studio>[a-z]{4,8})(?P<num>\d{3,8})(?P<ver>[a-z]{0,2})$'
+    template: '{studio}-{num}{ver}'
+    dup_suffix: ' ({dup})'
+    priority: 65
