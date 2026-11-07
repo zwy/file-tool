@@ -32,6 +32,26 @@ from typing import Optional
 from .fingerprint import FrameSignature
 
 
+# 缓存格式版本。指纹里新增了什么分量（dHash / 亮度 / 帧间差异），
+# 版本号就得跟着加 —— 否则旧缓存会被当成新缓存继续用，
+# 新增的分量等于白加（实测踩过：加了亮度分量，缓存里还是旧的没亮度的，
+# 亮度校验在整轮扫描里被整体跳过）。
+CACHE_VERSION = 3
+
+
+# 缓存里除了 dHash 序列，还要存平均亮度序列。
+#
+# **为什么要存**：``FrameSignature.brightness`` 是匹配的第二道闸门
+# （纯红卡和纯蓝卡的 dHash 恒为 0，只有亮度能分开）。但缓存命中时
+# 走的不是 ``signature_from_raw``，而是从 JSON 里把字段拼回来 ——
+# 早先只存了 hashes/mad，``brightness`` 拼不回来就是空列表，
+# ``match()`` 里的 ``use_brightness`` 直接变成 False，
+# **整轮扫描的亮度校验被静默跳过**（实测踩过：缓存命中的那轮
+# 全库检测，亮度校验一次都没生效）。
+#
+# 所以这里必须把 brightness 一起落盘，否则「缓存」等于「把校验关掉」。
+
+
 def cache_dir() -> Path:
     """返回当前平台的缓存目录（不存在就建）。"""
     if os.name == "nt":
@@ -73,15 +93,18 @@ def load(path: Path, fps: float, seconds: float, size: int) -> Optional[FrameSig
         data = json.loads(file.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
+    if data.get("version") != CACHE_VERSION:
+        return None
     if data.get("size") != sig[0] or data.get("mtime") != sig[1]:
         return None
     if data.get("fps") != fps or data.get("seconds") != seconds or data.get("size_px") != size:
         return None
     hashes = data.get("hashes") or []
     mad = data.get("mad") or []
+    brightness = data.get("brightness") or []
     if not hashes:
         return None
-    return FrameSignature(hashes=hashes, mad=mad, fps=fps)
+    return FrameSignature(hashes=hashes, mad=mad, brightness=brightness, fps=fps)
 
 
 def store(path: Path, signature: FrameSignature, seconds: float, size: int) -> None:
@@ -90,6 +113,7 @@ def store(path: Path, signature: FrameSignature, seconds: float, size: int) -> N
     if sig is None:
         return
     payload = {
+        "version": CACHE_VERSION,
         "size": sig[0],
         "mtime": sig[1],
         "fps": signature.fps,
@@ -97,6 +121,7 @@ def store(path: Path, signature: FrameSignature, seconds: float, size: int) -> N
         "size_px": size,
         "hashes": list(signature.hashes),
         "mad": [round(v, 4) for v in signature.mad],
+        "brightness": [round(v, 3) for v in signature.brightness],
     }
     file = cache_dir() / f"{_key(path)}.json"
     try:

@@ -895,7 +895,7 @@ def _load_ad_bank(path: Optional[Path]):
 def adcut_scan(
     root: str = typer.Argument(..., help="要扫描的目录"),
     templates: Optional[Path] = typer.Option(None, "--templates", help="模板库路径"),
-    head_seconds: float = typer.Option(180.0, "--head-seconds", help="只看开头多少秒"),
+    head_seconds: float = typer.Option(adcut_detect.DEFAULT_HEAD_SECONDS, "--head-seconds", help="只看开头多少秒"),
     jobs: int = typer.Option(4, "--jobs", help="并发数"),
     limit: int = typer.Option(0, help="最多处理几个视频（0 = 全部）"),
     json_out: bool = typer.Option(False, "--json", help="以 JSON 输出"),
@@ -976,7 +976,7 @@ def _print_detections(items, title: str, color, hint: bool = False) -> None:
 def adcut_cluster(
     root: str = typer.Argument(..., help="要扫描的目录"),
     templates: Optional[Path] = typer.Option(None, "--templates", help="模板库路径"),
-    head_seconds: float = typer.Option(180.0, "--head-seconds", help="只看开头多少秒"),
+    head_seconds: float = typer.Option(adcut_detect.DEFAULT_HEAD_SECONDS, "--head-seconds", help="只看开头多少秒"),
     jobs: int = typer.Option(4, "--jobs", help="并发数"),
     json_out: bool = typer.Option(False, "--json", help="以 JSON 输出"),
 ) -> None:
@@ -1052,11 +1052,18 @@ def adcut_learn(
     label: str = typer.Option("", "--label", help="给这支广告起个名字"),
     templates: Optional[Path] = typer.Option(None, "--templates", help="模板库路径"),
     note: str = typer.Option("", "--note", help="备注"),
+    replace: Optional[str] = typer.Option(
+        None, "--replace", help="覆盖这条已有模板（改边界时用），保留 id 和计数",
+    ),
 ) -> None:
     """把一支广告学进模板库。
 
     只需要**一支**广告的样本 —— 同族的所有视频会自动命中它。
     反复对同一支广告执行本命令会合并到已有模板（samples 递增）。
+
+    ``--replace tpl-0002`` 用来**改**已有模板的边界：库里的模板长度
+    （也就是裁剪点）划错了时，覆盖比新建好 —— 新建会让「错的旧模板」
+    和「对的新模板」同时留在库里，两条都能匹配上，结果是随机切。
     """
     path = Path(video).expanduser()
     if not path.exists():
@@ -1073,16 +1080,35 @@ def adcut_learn(
     if not signature.hashes:
         _die("取不到片头帧，视频是不是太短了？")
 
-    template, created = adcut_templates.learn(
-        bank, signature.hashes, sample=str(path), label=label, note=note,
-        brightness=signature.brightness,
-    )
+    if replace:
+        try:
+            template = adcut_templates.replace_template(
+                bank, replace, signature.hashes, sample=str(path),
+                label=label, note=note, brightness=signature.brightness,
+            )
+        except adcut_templates.TemplateError as exc:
+            _die(str(exc))
+        created = False
+    else:
+        try:
+            template, created = adcut_templates.learn(
+                bank, signature.hashes, sample=str(path), label=label, note=note,
+                brightness=signature.brightness,
+            )
+        except adcut_templates.TemplateError as exc:
+            _die(str(exc))
     try:
         adcut_templates.save_bank(bank, templates_path)
     except Exception as exc:
         _die(f"模板库写入失败：{exc}")
 
-    if created:
+    if replace:
+        typer.secho(
+            f"已覆盖模板 {template.id}：{template.label or '（未命名）'} "
+            f"（{template.seconds_label}）",
+            fg=typer.colors.GREEN,
+        )
+    elif created:
         typer.secho(
             f"新建模板 {template.id}：{template.label or '（未命名）'} "
             f"（{template.seconds_label}）",
@@ -1140,7 +1166,7 @@ def adcut_cut_cmd(
     root: str = typer.Argument(..., help="要裁剪的目录"),
     apply: bool = typer.Option(False, "--apply", help="真正执行裁剪（默认只预览）"),
     templates: Optional[Path] = typer.Option(None, "--templates", help="模板库路径"),
-    head_seconds: float = typer.Option(180.0, "--head-seconds", help="只看开头多少秒"),
+    head_seconds: float = typer.Option(adcut_detect.DEFAULT_HEAD_SECONDS, "--head-seconds", help="只看开头多少秒"),
     jobs: int = typer.Option(4, "--jobs", help="并发扫描数"),
     accurate: bool = typer.Option(False, "--accurate", help="强制重编码，切在精确帧"),
     max_snap: float = typer.Option(2.0, "--max-snap", help="关键帧吸附上限（秒）"),

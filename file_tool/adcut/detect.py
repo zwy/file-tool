@@ -41,7 +41,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from . import cache, ffmpeg, fingerprint
-from .models import AdPlan, Cluster, Detection, TemplateBank, Verdict
+from .models import AdPlan, Cluster, Detection, TemplateBank, TemplateStatus, Verdict
 from .templates import is_negative
 
 # 视频扩展名。只认视频 —— 图片（jpg）和字幕不参与广告判定
@@ -50,9 +50,17 @@ VIDEO_EXTENSIONS = {
     ".ts", ".m4v", ".rmvb", ".webm", ".vob",
 }
 
-# 默认只看片头这么多秒。实测最长的一支片头广告约 90 秒，
-# 留 180 秒余量；再多就浪费解码时间了
-DEFAULT_HEAD_SECONDS = 180.0
+# 默认只看片头这么多秒。
+#
+# **为什么是 300 而不是 180**：实测「站方推广片」是一段**多卡片轮播**，
+# 每张卡片 4~8 秒，从手机画面、二维码、到「票选前10大 最红女优」，
+# 实测各变体的真实长度在 **190 ~ 235 秒**之间（早先按 180 秒的窗口
+# 看拼图，只看到广告的前半段，把边界误判成 134~166 秒 ——
+# 结果是切在广告中间，剪完还剩半段广告）。
+#
+# 窗口必须装得下**最长**的模板（还要留几帧的偏移余量），
+# 否则判定层会认为「模板装不下」而不敢下刀。
+DEFAULT_HEAD_SECONDS = 300.0
 
 # 置信度分档
 AUTO_CUT_THRESHOLD = 0.80
@@ -171,6 +179,14 @@ def detect_video(
         )
 
     # ---- 模板匹配 ----
+    #
+    # 挑哪条模板，优先级：**整条匹配上 > 人工确认过 > 匹配得长 > 覆盖率高**。
+    #
+    # 「人工确认过」这一条是必要的：模板长度现在是**边界**，
+    # 一条被人眼量过的模板和一个机器猜的模板都整条匹配上时，
+    # 该信人眼那条 —— 机器猜的边界可能把片名卡也切进去。
+    # （实测 AKID-103 整条匹配上了 227 秒的人工模板，
+    #   也整条匹配上了 230 秒的机器模板 —— 按「匹配得长」会挑错。）
     best_id = ""
     best_label = ""
     best_result = fingerprint.MatchResult(matched=False)
@@ -181,7 +197,7 @@ def detect_video(
             template_brightness=template.brightness or None,
             video_brightness=signature.brightness or None,
         )
-        if best_id == "" or fingerprint._better(result, best_result):
+        if best_id == "" or _better_template(result, template.status, best_result, best_status):
             best_id = template.id
             best_label = template.label
             best_result = result
@@ -215,7 +231,11 @@ def detect_video(
     # 模板的长度是**人划出来的**，是唯一可信的边界。匹配长度只用来
     # 回答另一个问题：「这个视频的开头是不是这支广告」。
     template_len = best_result.template_len
-    if best_result.offset + template_len > len(signature.hashes):
+    # 广告不一定从第 0 帧开始（前面可能挂着站点 logo、黑场）。
+    # ``match()`` 里的 offset 就是模板起点在视频里的位置 ——
+    # 裁剪点必须把这段偏移也算上，否则会切早几秒，把广告尾巴留在片头。
+    offset = best_result.offset
+    if offset + template_len > len(signature.hashes):
         # 片头窗口不够长，装不下整条模板 —— 不能判
         return Detection(
             path=label, duration=info.duration, size=info.size,
@@ -231,21 +251,13 @@ def detect_video(
             ),
         )
 
-    cut_frame = template_len
+    cut_frame = offset + template_len
     cut_at = cut_frame / fps if fps else 0.0
     mad_value = signature.mad[cut_frame] if 0 <= cut_frame < len(signature.mad) else 0.0
 
-    confidence = best_result.score
-    if mad_value >= 12.0:
-        # 边界处确实有画面硬切 —— 独立佐证
-        confidence = min(0.99, confidence + 0.03)
-    elif mad_value < 4.0:
-        # 边界处几乎没变化 —— 广告可能还没结束，或者模板记错了
-        confidence = max(0.0, confidence - 0.12)
-
-    # 模板还没被人工确认过 —— 不允许自动开刀
-    if best_status is not None and best_status.value != "confirmed":
-        confidence = min(confidence, AUTO_CUT_THRESHOLD - 0.01)
+    confidence, incomplete = compute_confidence(
+        best_result, mad_value, best_status, template_len,
+    )
 
     if confidence >= AUTO_CUT_THRESHOLD:
         verdict = Verdict.CUT
@@ -258,10 +270,17 @@ def detect_video(
         f"匹配 {best_label or best_id}：连续 {best_result.prefix_len}/{template_len} 帧"
         f"（{best_result.prefix_len / fps:.1f}s）"
     )
+    if offset:
+        reason += f"，广告从第 {offset} 秒开始"
     if mad_value >= 12.0:
         reason += f"，裁剪点处画面差异 {mad_value:.0f}（硬切，可信）"
     else:
         reason += f"，裁剪点处画面差异仅 {mad_value:.0f}（无明显硬切，需人工确认）"
+    if incomplete:
+        reason += (
+            f"；模板只对上了前 {best_result.prefix_len / fps:.0f}s，"
+            f"这段视频的广告可能更长或更短，不能自动切"
+        )
 
     detection = Detection(
         path=label,
@@ -282,6 +301,80 @@ def detect_video(
     )
     detection.note = _subtitle_note(path)
     return detection
+
+
+def _confirmed(status: Optional[TemplateStatus]) -> bool:
+    """这条模板是不是被人眼确认过。"""
+    return status is not None and status.value == "confirmed"
+
+
+def _better_template(
+    candidate: fingerprint.MatchResult,
+    candidate_status: Optional[TemplateStatus],
+    current: fingerprint.MatchResult,
+    current_status: Optional[TemplateStatus],
+) -> bool:
+    """挑模板的优先级：整条匹配 > 人工确认 > 匹配得长 > 覆盖率高。
+
+    为什么要「人工确认」排在「匹配得长」前面：模板长度就是**裁剪点**。
+    一条被人眼量过边界的模板，和一条机器猜的模板，都整条匹配上同一个视频时，
+    该信人眼那条 —— 机器猜的边界可能把片名卡也切进去。
+    """
+    candidate_full = candidate.prefix_len >= candidate.template_len > 0
+    current_full = current.prefix_len >= current.template_len > 0
+    if candidate_full != current_full:
+        return candidate_full
+    if _confirmed(candidate_status) != _confirmed(current_status):
+        return _confirmed(candidate_status)
+    if candidate.prefix_len != current.prefix_len:
+        return candidate.prefix_len > current.prefix_len
+    return candidate.coverage > current.coverage
+
+
+def compute_confidence(
+    result: fingerprint.MatchResult,
+    mad_value: float,
+    status: Optional[TemplateStatus] = None,
+    template_len: int = 0,
+) -> Tuple[float, bool]:
+    """算出置信分，并说明这次匹配是不是「不完整」。
+
+    返回 ``(置信分, 是否匹配不完整)``。
+
+    ## 三道修正
+
+    1. **裁剪点处的画面突变**：硬切（MAD ≥ 12）加 0.03 —— 独立佐证，
+       说明模板记对了；几乎没变化（MAD < 4）减 0.12 —— 广告可能还没结束。
+
+    2. **模板没被人工确认过**：封顶到人工确认档。机器自己认出来的模板，
+       第一次见到不足以让后续视频自动开刀。
+
+    3. **匹配不完整**（``prefix_len < template_len``）：封顶到人工确认档。
+       裁剪点取的是**模板长度**，而模板的后半段在这个视频里没被验证过，
+       只有两种可能：这支视频的广告比模板短（切过头，把正片也削了），
+       或者比模板长（切不到底，广告还留着）。
+
+       这条是实测踩出来的：公式 ``0.45 + 0.5×比例`` 给 105/160 这种
+       比例算出 0.78，叠上硬切的 +0.03 正好 0.81，越过自动裁剪的线 ——
+       而这几个视频的实际广告长度根本不是 160 秒，切下去会削掉
+       最多 55 秒正片。**分数公式区分不出这两种情况，必须单独封顶。**
+    """
+    confidence = result.score
+    if mad_value >= 12.0:
+        # 边界处确实有画面硬切 —— 独立佐证
+        confidence = min(0.99, confidence + 0.03)
+    elif mad_value < 4.0:
+        # 边界处几乎没变化 —— 广告可能还没结束，或者模板记错了
+        confidence = max(0.0, confidence - 0.12)
+
+    if status is not None and status.value != "confirmed":
+        confidence = min(confidence, AUTO_CUT_THRESHOLD - 0.01)
+
+    incomplete = template_len > 0 and result.prefix_len < template_len
+    if incomplete:
+        confidence = min(confidence, AUTO_CUT_THRESHOLD - 0.01)
+
+    return confidence, incomplete
 
 
 def _static_ratio(mad: Sequence[float], threshold: float = 2.0) -> float:
@@ -387,6 +480,9 @@ def cluster_unknown(
         按片头**公共前缀**聚类。分组规则是「**加入公共前缀最长的那一组**」
         而不是「第一个能匹配上的组」—— 一个长变体同时匹配短组和长组，
         只有进最长那一组才对。
+
+    注意这里**不能**按 ``note`` 过滤：``NONE`` 的 note 是「开头几乎静止，
+    可能是没认识的片头卡」—— 这类视频恰恰是最该被聚出来的。
     """
     clusters: List[Cluster] = []
 
@@ -410,12 +506,18 @@ def cluster_unknown(
         ))
 
     # ---- NONE：按公共前缀聚类 ----
+    #
+    # 代表列表和分组列表必须**一一对应**。之前这两份列表是分开的
+    # （``clusters`` 里还塞着前面 REVIEW 的组），结果 ``representatives``
+    # 的下标和 ``clusters`` 的下标对不上，成员被挂进了错误的组 ——
+    # 29 个毫无关系的视频被凑成了一组。
     if signatures:
         candidates = [
             d for d in plan.detections
-            if d.verdict is Verdict.NONE and not d.note
+            if d.verdict is Verdict.NONE
         ]
-        representatives: List[List[int]] = []
+        none_clusters: List[Cluster] = []
+        none_reps: List[List[int]] = []
         for detection in sorted(candidates, key=lambda d: d.path):
             hashes = signatures.get(detection.path)
             if not hashes or len(hashes) < prefix_frames:
@@ -424,7 +526,7 @@ def cluster_unknown(
 
             best_index = -1
             best_key = (0, 0)
-            for index, rep in enumerate(representatives):
+            for index, rep in enumerate(none_reps):
                 result = fingerprint.match(rep, head, tolerance=tolerance)
                 if result.prefix_len < prefix_frames:
                     continue
@@ -434,16 +536,18 @@ def cluster_unknown(
                     best_index = index
 
             if best_index >= 0:
-                clusters[best_index].members.append(detection.path)
+                none_clusters[best_index].members.append(detection.path)
                 continue
 
-            clusters.append(Cluster(
+            none_clusters.append(Cluster(
                 id="",
                 members=[detection.path],
                 frames=prefix_frames,
                 representative=detection.path,
             ))
-            representatives.append(head)
+            none_reps.append(head)
+
+        clusters.extend(none_clusters)
 
     # 只保留有 2 个以上成员的组 —— 单例不值得人工花时间
     result = [c for c in clusters if c.size >= 2]

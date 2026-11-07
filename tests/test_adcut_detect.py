@@ -16,7 +16,7 @@ import pytest
 
 from file_tool.adcut import cut as cut_mod
 from file_tool.adcut import detect, ffmpeg, templates
-from file_tool.adcut.models import TemplateBank, Verdict
+from file_tool.adcut.models import TemplateBank, TemplateStatus, Verdict
 
 HAS_FFMPEG = ffmpeg.find_executable("ffmpeg") is not None and \
     ffmpeg.find_executable("ffprobe") is not None
@@ -39,6 +39,31 @@ def make_video(path: Path, ad_seconds: int = 5, content_seconds: int = 10) -> Pa
         "-f", "lavfi", "-i",
         f"smptebars=size=320x240:rate=10:duration={content_seconds}",
         "-filter_complex", "[0:v][1:v]concat=n=2:v=1:a=0[v]",
+        "-map", "[v]", "-pix_fmt", "yuv420p",
+        str(path),
+    ]
+    subprocess.run(cmd, capture_output=True, check=True, timeout=120)
+    return path
+
+
+def make_video_with_prelude(
+    path: Path, prelude_seconds: int = 2, ad_seconds: int = 5, content_seconds: int = 10
+) -> Path:
+    """造一段「前头还挂着别的东西」的视频。
+
+    用来复现实测里「广告不是从第 0 帧开始」的情况 ——
+    有些发行版前面还有站点 logo 或黑场。裁剪点必须把这几秒算进去，
+    否则会切早，把广告尾巴留在片头。
+    """
+    cmd = [
+        ffmpeg.require_executable("ffmpeg"), "-v", "error", "-y",
+        "-f", "lavfi", "-i",
+        f"rgbtestsrc=size=320x240:rate=10:duration={prelude_seconds}",
+        "-f", "lavfi", "-i",
+        f"testsrc2=size=320x240:rate=10:duration={ad_seconds}",
+        "-f", "lavfi", "-i",
+        f"smptebars=size=320x240:rate=10:duration={content_seconds}",
+        "-filter_complex", "[0:v][1:v][2:v]concat=n=3:v=1:a=0[v]",
         "-map", "[v]", "-pix_fmt", "yuv420p",
         str(path),
     ]
@@ -108,6 +133,121 @@ class TestDetect:
         detection = detect.detect_video(other, ad_bank)
         assert detection.verdict is Verdict.NONE
 
+    def test_cut_point_accounts_for_ad_offset(self, tmp_path: Path, ad_bank: TemplateBank):
+        """广告前面还挂着东西时，裁剪点要把这段偏移算进去。
+
+        回归测试：原来裁剪点直接取「模板长度」，忘了加上
+        ``match()`` 找出来的 offset —— 广告从第 2 秒开始时，
+        裁剪点会早 2 秒，广告尾巴留在片头。
+        """
+        video = make_video_with_prelude(tmp_path / "prelude.mp4", prelude_seconds=2)
+        detection = detect.detect_video(video, ad_bank)
+        assert detection.verdict is Verdict.CUT
+        # 广告 2~7 秒 → 裁剪点应该是 7 秒，不是 5 秒
+        assert detection.cut_at == pytest.approx(7.0, abs=1.5)
+
+
+class TestTemplateChoice:
+    """挑哪条模板的优先级：整条匹配 > 人工确认 > 匹配得长 > 覆盖率高。"""
+
+    def _result(self, prefix_len: int, template_len: int):
+        from file_tool.adcut import fingerprint
+        return fingerprint.MatchResult(
+            matched=True, offset=0, prefix_len=prefix_len,
+            coverage=prefix_len / template_len, template_len=template_len,
+        )
+
+    def test_full_match_beats_partial(self):
+        assert detect._better_template(
+            self._result(50, 50), TemplateStatus.CANDIDATE,
+            self._result(200, 227), TemplateStatus.CONFIRMED,
+        )
+
+    def test_confirmed_beats_longer_candidate(self):
+        """人工确认过的模板优先，哪怕匹配得短一点。
+
+        回归测试：模板长度就是裁剪点，人眼量过的边界该信人眼那条。
+        """
+        assert detect._better_template(
+            self._result(227, 227), TemplateStatus.CONFIRMED,
+            self._result(230, 230), TemplateStatus.CANDIDATE,
+        )
+
+    def test_longer_prefix_wins_within_same_status(self):
+        assert detect._better_template(
+            self._result(105, 160), TemplateStatus.CONFIRMED,
+            self._result(90, 160), TemplateStatus.CONFIRMED,
+        )
+
+    def test_same_length_falls_back_to_coverage(self):
+        from file_tool.adcut import fingerprint
+        low = self._result(100, 160)
+        high = fingerprint.MatchResult(
+            matched=True, prefix_len=100, coverage=0.9, template_len=160,
+        )
+        assert detect._better_template(high, TemplateStatus.CONFIRMED, low, TemplateStatus.CONFIRMED)
+
+
+class TestConfidence:
+    """置信度分档的规则。
+
+    核心是三道封顶：模板没人工确认过、匹配不完整、裁剪点处没有硬切。
+    """
+
+    def _result(self, prefix_len: int, template_len: int):
+        from file_tool.adcut import fingerprint
+        return fingerprint.MatchResult(
+            matched=True, offset=0, prefix_len=prefix_len,
+            coverage=prefix_len / template_len, template_len=template_len,
+            score=fingerprint.score_of(fingerprint.MatchResult(
+                matched=True, prefix_len=prefix_len, template_len=template_len,
+            )),
+        )
+
+    def test_full_match_with_hard_cut_is_auto_cut(self):
+        """模板整条都对上，裁剪点处又有硬切 —— 直接裁。"""
+        result = self._result(160, 160)
+        confidence, incomplete = detect.compute_confidence(
+            result, mad_value=40.0, status=TemplateStatus.CONFIRMED, template_len=160,
+        )
+        assert not incomplete
+        assert confidence >= detect.AUTO_CUT_THRESHOLD
+
+    def test_incomplete_match_never_auto_cuts(self):
+        """模板只对上一部分 —— 绝不能自动裁。
+
+        回归测试：实测 105/160 这种比例，公式算出 0.78，叠上硬切的
+        +0.03 正好 0.81，越过 0.80 的自动裁剪线 —— 而那批视频的
+        实际广告长度根本不是 160 秒，切下去会削掉最多 55 秒正片。
+        """
+        result = self._result(105, 160)
+        confidence, incomplete = detect.compute_confidence(
+            result, mad_value=40.0, status=TemplateStatus.CONFIRMED, template_len=160,
+        )
+        assert incomplete
+        assert confidence < detect.AUTO_CUT_THRESHOLD
+        assert confidence >= detect.REVIEW_THRESHOLD
+
+    def test_candidate_template_never_auto_cuts(self):
+        """机器自己认出来的模板 —— 不允许直接开刀。"""
+        result = self._result(160, 160)
+        confidence, incomplete = detect.compute_confidence(
+            result, mad_value=40.0, status=TemplateStatus.CANDIDATE, template_len=160,
+        )
+        assert not incomplete
+        assert confidence < detect.AUTO_CUT_THRESHOLD
+
+    def test_flat_boundary_lowers_score(self):
+        """裁剪点处没有硬切 —— 降分。"""
+        result = self._result(160, 160)
+        hard, _ = detect.compute_confidence(
+            result, mad_value=40.0, status=TemplateStatus.CONFIRMED, template_len=160,
+        )
+        flat, _ = detect.compute_confidence(
+            result, mad_value=1.0, status=TemplateStatus.CONFIRMED, template_len=160,
+        )
+        assert flat < hard
+
 
 class TestPlanCutPoint:
     def test_prefers_keyframe_after_cut(self):
@@ -173,3 +313,46 @@ class TestCut:
         outcome = cut_mod.cut_video(tmp_path / "nope.mp4", cut_at=5.0)
         assert not outcome.ok
         assert "不存在" in outcome.reason
+
+
+class TestCluster:
+    def test_clusters_group_by_shared_head(self, tmp_path: Path):
+        """共享同一段片头的视频要聚到一组。"""
+        bank = TemplateBank()
+        videos = [make_video(tmp_path / f"v{i}.mp4") for i in range(3)]
+        plan = detect.scan_tree(tmp_path, bank)
+        signatures = detect.collect_signatures(videos, tmp_path)
+        clusters = detect.cluster_unknown(plan, signatures=signatures)
+        assert len(clusters) == 1
+        assert clusters[0].size == 3
+
+    def test_different_heads_are_not_grouped(self, tmp_path: Path):
+        """内容完全不同的视频不能被凑成一组。
+
+        这条是回归测试：曾经聚类时代表列表和分组列表下标错位，
+        把 29 个毫无关系的视频挂进了同一个组。
+        """
+        bank = TemplateBank()
+        a = make_video(tmp_path / "a.mp4")
+        b = make_video(tmp_path / "b.mp4")
+        # b 用另一种画面源 —— 指纹完全不同
+        subprocess.run([
+            ffmpeg.require_executable("ffmpeg"), "-v", "error", "-y",
+            "-f", "lavfi", "-i", "smptebars=size=320x240:rate=10:duration=15",
+            "-pix_fmt", "yuv420p", str(b),
+        ], capture_output=True, check=True, timeout=120)
+
+        plan = detect.scan_tree(tmp_path, bank)
+        signatures = detect.collect_signatures([a, b], tmp_path)
+        clusters = detect.cluster_unknown(plan, signatures=signatures)
+        assert all(cluster.size == 1 for cluster in clusters)
+
+    def test_review_variants_group_by_divergence(self, tmp_path: Path, ad_bank: TemplateBank):
+        """REVIEW 的视频按「匹配长度」（变体分叉点）分组。"""
+        video = make_video(tmp_path / "a.mp4")
+        plan = detect.scan_tree(tmp_path, ad_bank)
+        detections = [d for d in plan.detections if d.verdict is Verdict.REVIEW]
+        if not detections:
+            pytest.skip("该样本没进 REVIEW 档")
+        clusters = detect.cluster_unknown(plan, signatures={})
+        assert all(cluster.note for cluster in clusters)

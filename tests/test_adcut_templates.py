@@ -174,3 +174,53 @@ class TestMatching:
         assert templates.remove_template(bank, template.id)
         assert not templates.remove_template(bank, template.id)
         assert bank.templates == []
+
+
+class TestReplace:
+    """改边界用 ``replace``，不用 ``learn``。
+
+    实测踩过的坑：模板长度划错了（把一段 200 秒的推广片记成 137 秒），
+    走 ``learn`` 的话长度差超过 2 帧就**新建**一条模板 ——
+    库里会同时躺着「错的旧模板」和「对的新模板」，两条都能匹配上，
+    谁赢看分数，结果就是随机切。覆盖才是对的。
+    """
+
+    def test_replaces_fingerprints_and_keeps_id(self):
+        bank = TemplateBank()
+        template, _ = templates.learn(bank, _hashes(1, count=12), sample="/a.mp4")
+        replaced = templates.replace_template(
+            bank, template.id, _hashes(1, count=200), sample="/b.mp4",
+        )
+        assert replaced.id == template.id
+        assert len(replaced.hashes) == 200
+        assert bank.get(template.id) is replaced
+        assert len(bank.templates) == 1
+
+    def test_replacement_keeps_history(self):
+        """覆盖之后 id、计数、状态都保留 —— 它还是同一支广告。"""
+        bank = TemplateBank()
+        template, _ = templates.learn(bank, _hashes(1, count=12), sample="/a.mp4")
+        templates.replace_template(bank, template.id, _hashes(1, count=200))
+        assert bank.templates[0].samples == 2
+        assert bank.templates[0].status is TemplateStatus.CONFIRMED
+        assert bank.templates[0].first_seen
+
+    def test_replacement_can_relabel(self):
+        bank = TemplateBank()
+        template, _ = templates.learn(bank, _hashes(1, count=12), sample="/a.mp4")
+        templates.replace_template(
+            bank, template.id, _hashes(1, count=200), label="新标签", note="改过边界",
+        )
+        assert bank.templates[0].label == "新标签"
+        assert bank.templates[0].note == "改过边界"
+
+    def test_replace_unknown_id_fails(self):
+        bank = TemplateBank()
+        with pytest.raises(templates.TemplateError):
+            templates.replace_template(bank, "tpl-9999", _hashes(1))
+
+    def test_replace_empty_fingerprints_fails(self):
+        bank = TemplateBank()
+        template, _ = templates.learn(bank, _hashes(1), sample="/a.mp4")
+        with pytest.raises(templates.TemplateError):
+            templates.replace_template(bank, template.id, [])

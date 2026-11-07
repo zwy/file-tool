@@ -270,6 +270,53 @@ def reject(
     return negative
 
 
+def replace_template(
+    bank: TemplateBank,
+    template_id: str,
+    hashes: List[int],
+    sample: str = "",
+    label: str = "",
+    note: str = "",
+    fps: float = 1.0,
+    brightness: Optional[List[float]] = None,
+) -> AdTemplate:
+    """**覆盖**一条已有模板的指纹（保留 id 和计数）。
+
+    什么时候需要它：模板的**长度**（也就是裁剪点）划错了 —— 比如
+    早期按 180 秒的窗口看拼图，把一段 200 秒的推广片当成了 137 秒，
+    切点落在广告中间。
+
+    这时候不能走 :func:`learn`：``learn`` 是拿新指纹去「找同类」，
+    长度差超过 2 帧就新建一条模板，于是库里会同时躺着
+    「错误长度的旧模板」和「正确长度的新模板」，两条都能匹配上，
+    谁赢要看分数 —— 结果就是随机切。
+
+    所以这里显式覆盖：id 不变，``samples`` 继续累加，
+    旧指纹直接换掉。
+    """
+    template = bank.get(template_id)
+    if template is None:
+        raise TemplateError(f"模板库里没有 {template_id}")
+    if not hashes:
+        raise TemplateError("没有可学习的指纹（片头太短？）")
+
+    template.hashes = list(hashes)
+    template.brightness = list(brightness or [])
+    template.fps = fps
+    template.samples += 1
+    template.status = TemplateStatus.CONFIRMED
+    template.last_seen = _today()
+    if not template.first_seen:
+        template.first_seen = _today()
+    if sample:
+        template.sample = sample
+    if label:
+        template.label = label
+    if note:
+        template.note = note
+    return template
+
+
 def remove_template(bank: TemplateBank, template_id: str) -> bool:
     """删掉一条模板。"""
     before = len(bank.templates)
