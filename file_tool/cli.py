@@ -23,11 +23,18 @@ from file_tool import isolate as isolate_mod
 from file_tool import merge as merge_mod
 from file_tool import rename_files as rename_files_mod
 from file_tool import tidy as tidy_mod
+from file_tool.adcut import cache as adcut_cache
+from file_tool.adcut import cut as adcut_cut
+from file_tool.adcut import detect as adcut_detect
+from file_tool.adcut import fingerprint as adcut_fingerprint
+from file_tool.adcut import templates as adcut_templates
+from file_tool.adcut.models import Verdict
 from file_tool.merge import MergeAction, MergeVerdict
 from file_tool.models import Action, RuleSet
 from file_tool.tidy import StepKind
 
 DEFAULT_RULES = Path(__file__).resolve().parent.parent / "rules" / "numbering.yaml"
+DEFAULT_AD_TEMPLATES = Path(__file__).resolve().parent.parent / "rules" / "ad_templates.yaml"
 
 app = typer.Typer(
     help="本地文件整理 CLI：批量重命名目录、番号规范化",
@@ -35,6 +42,8 @@ app = typer.Typer(
 )
 rules_app = typer.Typer(help="规则集管理", no_args_is_help=True)
 app.add_typer(rules_app, name="rules")
+adcut_app = typer.Typer(help="片头广告识别与裁剪", no_args_is_help=True)
+app.add_typer(adcut_app, name="ad-cut")
 
 
 def _force_utf8_output() -> None:
@@ -856,6 +865,469 @@ def _print_plan(plan) -> None:
         typer.echo(f"{item.original}  ->  {item.target}")
         if item.action is Action.CONFLICT:
             typer.secho(f"         {item.reason}", fg=typer.colors.RED)
+
+
+def _parse_time(value: str) -> float:
+    """把 ``12.5`` / ``00:00:12.5`` / ``1:02`` 解析成秒。"""
+    text = value.strip()
+    try:
+        parts = text.split(":")
+        if len(parts) == 1:
+            return float(parts[0])
+        if len(parts) == 2:
+            return int(parts[0]) * 60 + float(parts[1])
+        if len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+    except ValueError:
+        pass
+    raise typer.BadParameter(f"看不懂的时间格式：{value}（用 12.5 或 00:00:12.5）")
+
+
+def _load_ad_bank(path: Optional[Path]):
+    templates_path = path or DEFAULT_AD_TEMPLATES
+    try:
+        return adcut_templates.load_bank(templates_path), templates_path
+    except adcut_templates.TemplateError as exc:
+        _die(str(exc))
+
+
+@adcut_app.command("scan")
+def adcut_scan(
+    root: str = typer.Argument(..., help="要扫描的目录"),
+    templates: Optional[Path] = typer.Option(None, "--templates", help="模板库路径"),
+    head_seconds: float = typer.Option(180.0, "--head-seconds", help="只看开头多少秒"),
+    jobs: int = typer.Option(4, "--jobs", help="并发数"),
+    limit: int = typer.Option(0, help="最多处理几个视频（0 = 全部）"),
+    json_out: bool = typer.Option(False, "--json", help="以 JSON 输出"),
+    quiet: bool = typer.Option(False, "--quiet", help="只打摘要"),
+) -> None:
+    """扫描目录，判断每个视频开头有没有广告。
+
+    只读不写。判断依据是**模板库**：库里存着已知广告的感知指纹，
+    命中即判定为「有广告」。
+    """
+    root_dir = _resolve_root(root)
+    bank, _ = _load_ad_bank(templates)
+
+    def progress(done: int, total: int, _path) -> None:
+        if not quiet and not json_out and (done % 10 == 0 or done == total):
+            typer.echo(f"  扫描中 {done}/{total} …", nl=False if done < total else True)
+
+    plan = adcut_detect.scan_tree(
+        root_dir, bank, head_seconds=head_seconds, jobs=jobs, limit=limit,
+        on_progress=progress,
+    )
+
+    if json_out:
+        typer.echo(json.dumps(
+            {"root": plan.root, "summary": plan.summary(),
+             "detections": [d.model_dump(mode="json") for d in plan.detections],
+             "errors": plan.errors},
+            ensure_ascii=False, indent=2,
+        ))
+        return
+
+    counts = plan.summary()
+    typer.secho(f"目录：{root_dir}", bold=True)
+    typer.secho(
+        f"共 {counts['total']} 个视频 | 可裁 {counts['cut']} | "
+        f"待确认 {counts['review']} | 无广告 {counts['none']} | 跳过 {counts['skip']}",
+        fg=typer.colors.CYAN,
+    )
+    if counts["suspected"]:
+        typer.secho(
+            f"其中 {counts['suspected']} 个开头几乎静止，可能是没认识的片头卡 —— "
+            f"值得用 sheet 扫一眼",
+            fg=typer.colors.YELLOW,
+        )
+    _print_detections(plan.cut_items, "可裁", typer.colors.GREEN)
+    _print_detections(plan.review_items, "待确认", typer.colors.YELLOW, hint=True)
+    if counts["suspected"]:
+        _print_detections(plan.suspected_items, "疑似有广告（未识别）", typer.colors.YELLOW, hint=True)
+    if plan.errors:
+        typer.secho(f"\n出错 {len(plan.errors)} 个：", fg=typer.colors.RED)
+        for message in plan.errors[:5]:
+            typer.secho(f"  {message}", fg=typer.colors.RED)
+
+
+def _print_detections(items, title: str, color, hint: bool = False) -> None:
+    if not items:
+        return
+    typer.secho(f"\n{title}（{len(items)} 个）：", fg=color, bold=True)
+    for item in items[:40]:
+        typer.echo(
+            f"  {item.path}  切 {item.cut_at:.2f}s  "
+            f"置信 {item.confidence:.2f}  [{item.template_id}] {item.template_label}"
+        )
+        typer.secho(f"      {item.reason}", fg=typer.colors.CYAN)
+        if item.note:
+            typer.secho(f"      ⚠ {item.note}", fg=typer.colors.YELLOW)
+        if hint:
+            where = item.cut_at if item.cut_at > 0 else 10.0
+            typer.secho(
+                f"      肉眼确认：file-tool ad-cut sheet {item.path} --at {where:.0f}",
+                fg=typer.colors.YELLOW,
+            )
+    if len(items) > 40:
+        typer.echo(f"  … 另有 {len(items) - 40} 个")
+
+
+@adcut_app.command("cluster")
+def adcut_cluster(
+    root: str = typer.Argument(..., help="要扫描的目录"),
+    templates: Optional[Path] = typer.Option(None, "--templates", help="模板库路径"),
+    head_seconds: float = typer.Option(180.0, "--head-seconds", help="只看开头多少秒"),
+    jobs: int = typer.Option(4, "--jobs", help="并发数"),
+    json_out: bool = typer.Option(False, "--json", help="以 JSON 输出"),
+) -> None:
+    """找出「还没认识」的片头广告，按相似度聚成组。
+
+    同一组里的视频共享同一段片头。人工只要给其中**一个**划一刀
+    (``ad-cut learn``)，整组就都能自动处理了 —— 人工量正比于
+    广告种类数，而不是视频数。
+    """
+    root_dir = _resolve_root(root)
+    bank, _ = _load_ad_bank(templates)
+
+    plan = adcut_detect.scan_tree(root_dir, bank, head_seconds=head_seconds, jobs=jobs)
+    videos = adcut_detect.find_videos(root_dir)
+    signatures = adcut_detect.collect_signatures(
+        videos, root_dir, head_seconds=head_seconds
+    )
+    clusters = adcut_detect.cluster_unknown(plan, signatures=signatures)
+
+    if json_out:
+        typer.echo(json.dumps(
+            {"root": plan.root,
+             "clusters": [c.model_dump(mode="json") for c in clusters]},
+            ensure_ascii=False, indent=2,
+        ))
+        return
+
+    typer.secho(f"目录：{root_dir}", bold=True)
+    if not clusters:
+        typer.secho("没有发现共享同一段未知片头的视频组。", fg=typer.colors.GREEN)
+    else:
+        typer.secho(
+            f"发现 {len(clusters)} 组未知片头，共覆盖 "
+            f"{sum(c.size for c in clusters)} 个视频：",
+            fg=typer.colors.CYAN,
+        )
+        for cluster in clusters:
+            typer.secho(
+                f"\n[{cluster.id}] {cluster.size} 个视频共享同一段片头",
+                fg=typer.colors.YELLOW, bold=True,
+            )
+            if cluster.note:
+                typer.secho(f"  {cluster.note}", fg=typer.colors.CYAN)
+            typer.echo(f"  代表：{cluster.representative}")
+            for member in cluster.members[:8]:
+                typer.echo(f"    - {member}")
+            if cluster.size > 8:
+                typer.echo(f"    … 另有 {cluster.size - 8} 个")
+
+    suspected = plan.suspected_items
+    if suspected:
+        typer.secho(
+            f"\n另有 {len(suspected)} 个视频开头几乎静止、但没匹配到任何模板 —— "
+            f"可能是只出现过一次的片头卡：",
+            fg=typer.colors.YELLOW,
+        )
+        for item in suspected[:15]:
+            typer.echo(f"  {item.path}  （静止 {item.static_ratio * 100:.0f}%）")
+        if len(suspected) > 15:
+            typer.echo(f"  … 另有 {len(suspected) - 15} 个")
+
+    typer.secho(
+        "\n给每组挑一个代表，量出广告结束时间后学进模板库：\n"
+        "  file-tool ad-cut learn <视频> --end 12.5 --label \"厂牌片头\"",
+        fg=typer.colors.CYAN,
+    )
+
+
+@adcut_app.command("learn")
+def adcut_learn(
+    video: str = typer.Argument(..., help="拿哪个视频当样本"),
+    end: str = typer.Option(..., "--end", help="广告结束时间（秒或 00:00:12.5）"),
+    label: str = typer.Option("", "--label", help="给这支广告起个名字"),
+    templates: Optional[Path] = typer.Option(None, "--templates", help="模板库路径"),
+    note: str = typer.Option("", "--note", help="备注"),
+) -> None:
+    """把一支广告学进模板库。
+
+    只需要**一支**广告的样本 —— 同族的所有视频会自动命中它。
+    反复对同一支广告执行本命令会合并到已有模板（samples 递增）。
+    """
+    path = Path(video).expanduser()
+    if not path.exists():
+        _die(f"文件不存在：{path}")
+    cut_at = _parse_time(end)
+    if cut_at <= 0:
+        _die("--end 必须大于 0")
+
+    bank, templates_path = _load_ad_bank(templates)
+    try:
+        signature = adcut_fingerprint.segment_signature_of(path, 0.0, cut_at)
+    except Exception as exc:
+        _die(f"取帧失败：{exc}")
+    if not signature.hashes:
+        _die("取不到片头帧，视频是不是太短了？")
+
+    template, created = adcut_templates.learn(
+        bank, signature.hashes, sample=str(path), label=label, note=note,
+        brightness=signature.brightness,
+    )
+    try:
+        adcut_templates.save_bank(bank, templates_path)
+    except Exception as exc:
+        _die(f"模板库写入失败：{exc}")
+
+    if created:
+        typer.secho(
+            f"新建模板 {template.id}：{template.label or '（未命名）'} "
+            f"（{template.seconds_label}）",
+            fg=typer.colors.GREEN,
+        )
+    else:
+        typer.secho(
+            f"合并到已有模板 {template.id}（累计 {template.samples} 次确认，"
+            f"{template.seconds_label}）",
+            fg=typer.colors.GREEN,
+        )
+    typer.echo(f"  模板库：{templates_path}")
+    typer.secho(
+        f"  肉眼确认切点：file-tool ad-cut sheet {path} --at {cut_at:.0f}",
+        fg=typer.colors.CYAN,
+    )
+
+
+@adcut_app.command("reject")
+def adcut_reject(
+    video: str = typer.Argument(..., help="哪个视频"),
+    end: str = typer.Option(..., "--end", help="没广告的区间长度（秒）"),
+    reason: str = typer.Option("", "--reason", help="为什么这里没有广告"),
+    templates: Optional[Path] = typer.Option(None, "--templates", help="模板库路径"),
+) -> None:
+    """记一条负样本：这个片头其实没有广告，别再切它。"""
+    path = Path(video).expanduser()
+    if not path.exists():
+        _die(f"文件不存在：{path}")
+    cut_at = _parse_time(end)
+
+    bank, templates_path = _load_ad_bank(templates)
+    try:
+        signature = adcut_fingerprint.segment_signature_of(path, 0.0, cut_at)
+    except Exception as exc:
+        _die(f"取帧失败：{exc}")
+    if not signature.hashes:
+        _die("取不到片头帧，视频是不是太短了？")
+
+    negative = adcut_templates.reject(
+        bank, signature.hashes, sample=str(path), reason=reason,
+        brightness=signature.brightness,
+    )
+    try:
+        adcut_templates.save_bank(bank, templates_path)
+    except Exception as exc:
+        _die(f"模板库写入失败：{exc}")
+
+    typer.secho(f"已记负样本 {negative.id}，以后这类片头不会被自动裁。", fg=typer.colors.GREEN)
+    typer.echo(f"  模板库：{templates_path}")
+
+
+@adcut_app.command("cut")
+def adcut_cut_cmd(
+    root: str = typer.Argument(..., help="要裁剪的目录"),
+    apply: bool = typer.Option(False, "--apply", help="真正执行裁剪（默认只预览）"),
+    templates: Optional[Path] = typer.Option(None, "--templates", help="模板库路径"),
+    head_seconds: float = typer.Option(180.0, "--head-seconds", help="只看开头多少秒"),
+    jobs: int = typer.Option(4, "--jobs", help="并发扫描数"),
+    accurate: bool = typer.Option(False, "--accurate", help="强制重编码，切在精确帧"),
+    max_snap: float = typer.Option(2.0, "--max-snap", help="关键帧吸附上限（秒）"),
+    limit: int = typer.Option(0, help="最多裁几个（0 = 全部）"),
+    json_out: bool = typer.Option(False, "--json", help="以 JSON 输出"),
+) -> None:
+    """裁掉识别出来的片头广告。
+
+    原地替换：先写到同目录的临时文件，校验通过才顶掉原片；
+    任何一步失败原片都原封不动。默认只预览，加 ``--apply`` 才动手。
+    """
+    root_dir = _resolve_root(root)
+    bank, _ = _load_ad_bank(templates)
+
+    plan = adcut_detect.scan_tree(
+        root_dir, bank, head_seconds=head_seconds, jobs=jobs,
+    )
+    targets = plan.cut_items
+    if limit:
+        targets = targets[:limit]
+
+    if json_out:
+        # `--json` 下 stdout 上只有**一份** JSON —— 预览和执行结果合在一起输出，
+        # 下游 `json.loads(stdout)` 才能直接用
+        payload = {
+            "root": plan.root,
+            "targets": [d.model_dump(mode="json") for d in targets],
+        }
+        if apply:
+            outcomes = _run_cuts(root_dir, targets, max_snap, accurate)
+            payload["ok"] = sum(1 for o in outcomes if o.ok)
+            payload["failed"] = sum(1 for o in outcomes if not o.ok)
+            payload["outcomes"] = [o.model_dump(mode="json") for o in outcomes]
+        typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+
+    if not targets:
+        typer.secho("没有识别出可裁的视频。", fg=typer.colors.GREEN)
+        return
+
+    if not apply:
+        typer.secho(f"目录：{root_dir}", bold=True)
+        typer.secho(
+            f"将裁剪 {len(targets)} 个视频（原地替换，先写临时文件再校验）：",
+            fg=typer.colors.CYAN,
+        )
+        for item in targets[:40]:
+            typer.echo(
+                f"  {item.path}  切 {item.cut_at:.2f}s  置信 {item.confidence:.2f}  "
+                f"[{item.template_id}]"
+            )
+            if item.note:
+                typer.secho(f"      ⚠ {item.note}", fg=typer.colors.YELLOW)
+        if len(targets) > 40:
+            typer.echo(f"  … 另有 {len(targets) - 40} 个")
+        typer.secho(
+            "\n预览模式：确认无误后加 --apply 执行。",
+            fg=typer.colors.YELLOW,
+        )
+        return
+
+    outcomes = _run_cuts(root_dir, targets, max_snap, accurate)
+    ok = sum(1 for o in outcomes if o.ok)
+    failed = len(outcomes) - ok
+
+    for outcome in outcomes:
+        if outcome.ok:
+            typer.secho(f"  ✓ {outcome.path}  {outcome.reason}", fg=typer.colors.GREEN)
+        else:
+            typer.secho(f"  ✗ {outcome.path}  {outcome.reason}", fg=typer.colors.RED)
+
+    typer.secho(
+        f"\n裁剪完成：成功 {ok} 个，失败 {failed} 个（失败的原片保持不变）。",
+        fg=typer.colors.GREEN if not failed else typer.colors.YELLOW,
+    )
+
+
+def _run_cuts(root_dir: Path, targets, max_snap: float, accurate: bool):
+    """按计划逐个裁剪。"""
+    outcomes = []
+    for item in targets:
+        path = Path(item.path)
+        if not path.is_absolute():
+            path = root_dir / path
+        outcomes.append(
+            adcut_cut.cut_video(
+                path, cut_at=item.cut_at, max_snap=max_snap, accurate=accurate,
+            )
+        )
+    return outcomes
+
+
+@adcut_app.command("sheet")
+def adcut_sheet(
+    video: str = typer.Argument(..., help="哪个视频"),
+    at: str = typer.Option("0", "--at", help="想看的时间点（秒或 00:01:20）"),
+    span: float = typer.Option(60.0, "--span", help="前后一共看多少秒"),
+    interval: float = typer.Option(3.0, "--interval", help="每格几秒"),
+    columns: int = typer.Option(5, "--columns", help="每行几格"),
+    rows: int = typer.Option(4, "--rows", help="几行"),
+    out: Optional[Path] = typer.Option(None, "--out", help="输出 PNG 路径"),
+) -> None:
+    """生成时间轴拼图，肉眼确认广告在哪结束。
+
+    人工划刀时最耗时的是拖进度条。拼图把候选区间切成小图，
+    一眼就能看出「广告卡」和「正片」的分界在哪一格。
+
+    这套 ffmpeg 没有 drawtext，烧不了时间戳 —— 时间按格数推算，
+    输出里会给出「格号 ↔ 时间」的对照表。
+    """
+    path = Path(video).expanduser()
+    if not path.exists():
+        _die(f"文件不存在：{path}")
+    center = _parse_time(at)
+    start = max(0.0, center - span / 2.0)
+    try:
+        target = adcut_cut.contact_sheet(
+            path, at=center, span=span, interval=interval,
+            columns=columns, rows=rows, out=out,
+        )
+    except Exception as exc:
+        _die(f"生成拼图失败：{exc}")
+
+    typer.secho(f"拼图：{target}", fg=typer.colors.GREEN)
+    typer.secho(
+        f"从 {start:.1f}s 开始，每格 {interval:g} 秒，{columns}×{rows} 格：",
+        fg=typer.colors.CYAN,
+    )
+    for row in range(rows):
+        cells = []
+        for col in range(columns):
+            index = row * columns + col
+            cells.append(f"第{row * columns + col + 1}格={start + index * interval:.0f}s")
+        typer.echo("  " + "  ".join(cells))
+
+
+@adcut_app.command("templates")
+def adcut_templates_cmd(
+    templates: Optional[Path] = typer.Option(None, "--templates", help="模板库路径"),
+    json_out: bool = typer.Option(False, "--json", help="以 JSON 输出"),
+) -> None:
+    """列出模板库里已知的广告。"""
+    bank, templates_path = _load_ad_bank(templates)
+    if json_out:
+        typer.echo(json.dumps(
+            {"path": str(templates_path),
+             "templates": [t.model_dump(mode="json") for t in bank.templates],
+             "negatives": [n.model_dump(mode="json") for n in bank.negatives]},
+            ensure_ascii=False, indent=2,
+        ))
+        return
+
+    typer.secho(f"模板库：{templates_path}", bold=True)
+    if not bank.templates:
+        typer.secho("还没有任何模板 —— 用 ad-cut learn 学一支广告进来。",
+                    fg=typer.colors.YELLOW)
+        return
+    typer.secho(f"共 {len(bank.templates)} 支已知广告：", fg=typer.colors.CYAN)
+    for template in bank.templates:
+        typer.secho(
+            f"  [{template.id}] {template.label or '（未命名）':20s} "
+            f"{template.seconds_label:>7s}  确认 {template.samples} 次  "
+            f"{template.status.value}",
+            fg=typer.colors.GREEN if template.status.value == "confirmed" else typer.colors.YELLOW,
+        )
+        if template.sample:
+            typer.echo(f"      来源：{template.sample}")
+    if bank.negatives:
+        typer.secho(f"\n负样本 {len(bank.negatives)} 条：", fg=typer.colors.CYAN)
+        for negative in bank.negatives:
+            typer.echo(f"  [{negative.id}] {negative.reason or '（无说明）'}")
+
+
+@adcut_app.command("cache")
+def adcut_cache_cmd(
+    clear: bool = typer.Option(False, "--clear", help="清空指纹缓存"),
+) -> None:
+    """管理指纹缓存（纯加速用，删了不影响正确性）。"""
+    root = adcut_cache.cache_dir()
+    if clear:
+        count = adcut_cache.clear()
+        typer.secho(f"已清空 {count} 个缓存文件。", fg=typer.colors.GREEN)
+        return
+    files = list(root.glob("*.json"))
+    total = sum(item.stat().st_size for item in files)
+    typer.secho(f"缓存目录：{root}", bold=True)
+    typer.secho(f"共 {len(files)} 个缓存文件，占 {total / 1024:.1f} KB。")
 
 
 def main() -> None:
