@@ -33,9 +33,9 @@ def plan_for(ruleset, name: str):
         ("MIDE004", "MIDE-004"),
         ("CAWD660CX", "CAWD-660CX"),
         ("DNW102A", "DNW-102A"),
-        # 小写厂牌
-        ("nizuia00877", "nizuia-00877"),
-        ("dvdms00300a", "dvdms-00300a"),
+        # 小写厂牌 —— 规范名统一大写
+        ("nizuia00877", "NIZUIA-00877"),
+        ("dvdms00300a", "DVDMS-00300A"),
         # 数字前缀
         ("230ORECO-640CX", "ORECO-640CX"),
         ("107MMGH-313", "MMGH-313"),
@@ -91,14 +91,14 @@ def test_domestic_prefix_is_not_a_code(ruleset, original):
     "original,expected",
     [
         # 规范名必须能反解回自己（幂等）—— 否则第二次跑 rename 会改坏目录
-        ("dvdms-00300b", "dvdms-00300b"),
-        ("sdmu-00877b", "sdmu-00877b"),
+        ("DVDMS-00300B", "DVDMS-00300B"),
+        ("SDMU-00877B", "SDMU-00877B"),
         ("SVDVD-840 (1)", "SVDVD-840 (1)"),
         ("MAAN-961", "MAAN-961"),
         ("SDMM-030BC", "SDMM-030BC"),
         ("CLT-013C", "CLT-013C"),
         ("FC2-PPV-2549115", "FC2-PPV-2549115"),
-        ("avop-235-C", "avop-235-C"),
+        ("AVOP-235-C", "AVOP-235-C"),
     ],
 )
 def test_canonical_name_is_idempotent(ruleset, original, expected):
@@ -111,7 +111,7 @@ def test_canonical_name_is_idempotent(ruleset, original, expected):
 def test_optional_group_is_not_rendered_as_none(ruleset):
     """没参与匹配的可选分组是 None，不能渲染成字符串 "None"。"""
     item = plan_for(ruleset, "dvdms-00300b")
-    assert item.target == "dvdms-00300b"
+    assert item.target == "DVDMS-00300B"
     assert "None" not in item.target
 
 
@@ -186,7 +186,7 @@ def test_hyphen_duplicate_strip_does_not_override_correct_parse(tmp_path):
         ("MAAN-961", "MAAN-961"),
         ("IPZZ-118C", "IPZZ-118C"),
         ("SSIS-863C", "SSIS-863C"),
-        ("avop-235-C", "avop-235-C"),
+        ("AVOP-235-C", "AVOP-235-C"),
         ("FC2-PPV-4329956", "FC2-PPV-4329956"),
     ],
 )

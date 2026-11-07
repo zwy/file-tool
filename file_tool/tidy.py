@@ -174,7 +174,8 @@ def _looks_numbered(name: str, ruleset: RuleSet) -> bool:
     dup_sources = ruleset.dup_sources or ["dup"]
     core, captured = engine.strip_noise(name, ruleset.preprocess)
     base, _target, _rule, _desc, _core = engine.resolve_target(
-        core, captured, ordered, ruleset.preprocess, dup_sources, ruleset.exclude
+        core, captured, ordered, ruleset.preprocess, dup_sources,
+        ruleset.exclude, ruleset.uppercase,
     )
     return bool(base)
 
@@ -248,24 +249,20 @@ def build_tidy_plan(
         if mergeable or partial or different:
             step = TidyStep(
                 kind=StepKind.MERGE,
-                detail="合并内容完全一致的重复目录",
-                count=len(mergeable),
-                names=[g.base for g in mergeable],
+                detail="把同名目录合并成一个（文件级撞名按体积分配）",
+                count=len(mergeable) + len(partial) + len(different),
+                names=[g.base for g in mergeable + partial + different],
             )
             plan.steps.append(step)
 
-        if partial:
+        if partial or different:
             plan.notes.append(
-                f"{len(partial)} 组部分重叠（内容不同），默认不合并："
-                f"{', '.join(g.base for g in partial[:5])}"
-                + ("…" if len(partial) > 5 else "")
-                + "。加 --include-partial 可只并入不冲突的文件。"
-            )
-        if different:
-            plan.notes.append(
-                f"{len(different)} 组内容不同（不同版本/画质），保留各自独立："
-                f"{', '.join(g.base for g in different[:5])}"
-                + ("…" if len(different) > 5 else "")
+                f"{len(partial) + len(different)} 组内容不完全一致（{len(partial)} 组部分重叠、"
+                f"{len(different)} 组内容不同），也会合并："
+                f"{', '.join([g.base for g in (partial + different)][:5])}"
+                + ("…" if len(partial) + len(different) > 5 else "")
+                + "。同名文件按体积分配 —— 大的占规范名，小的改名 (2)；"
+                "内容完全相同的只留一份。"
             )
 
     # ---- Step 2: archive（平铺文件分装）----
@@ -357,7 +354,7 @@ def apply_tidy_plan(
     root: Path,
     ruleset: RuleSet,
     plan: TidyPlan,
-    include_partial: bool = False,
+    keep_separate: bool = False,
     clean_forks: bool = True,
     isolate_to: Optional[Path] = None,
 ) -> Dict[str, object]:
@@ -408,7 +405,7 @@ def apply_tidy_plan(
         elif step.kind is StepKind.MERGE:
             merge_plan = merge_mod.build_merge_plan(root, ruleset, names)
             merge_results = merge_mod.apply_merge_plan(
-                root, merge_plan, only_duplicates=not include_partial
+                root, merge_plan, only_duplicates=keep_separate
             )
             result["merged"] = sum(
                 1 for r in merge_results if r["action"] == merge_mod.MergeAction.MERGE.value

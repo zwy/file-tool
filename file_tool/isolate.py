@@ -190,7 +190,7 @@ def _code_from_cjk_dir_name(path: Path, ruleset: Optional[RuleSet]) -> str:
     core, captured = engine.strip_noise(path.name, ruleset.preprocess)
     base, _target, _rule, _desc, _core = engine.resolve_target(
         core, captured, ruleset.ordered_matches(), ruleset.preprocess,
-        ruleset.dup_sources or ["dup"], ruleset.exclude,
+        ruleset.dup_sources or ["dup"], ruleset.exclude, ruleset.uppercase,
     )
     return base or ""
 
@@ -273,7 +273,8 @@ def judge_directory(
         return item
 
     base, _target, _rule, _desc, _core = engine.resolve_target(
-        core, captured, ordered, ruleset.preprocess, dup_sources, ruleset.exclude
+        core, captured, ordered, ruleset.preprocess, dup_sources,
+        ruleset.exclude, ruleset.uppercase,
     )
     if base:
         item.isolation = Isolation.KEEP

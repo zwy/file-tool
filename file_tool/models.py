@@ -125,9 +125,33 @@ class RuleSet(BaseModel):
 
     排除是「整类形态」的判断，必须写在规则文件里而不是代码里 ——
     哪个前缀属于国产是领域知识，会随资料来源变化。
+
+    **匹配一律忽略大小写**（见 :meth:`is_excluded`）。国产编号的写法
+    本身就没有大小写规范：``xfxfz14468`` 和 ``XFXFZ14468`` 是同一个站
+    的同一种编号。如果排除是大小写敏感的，那么统一大写之后，
+    国产内容会因为「变成了大写形态」而不再命中排除名单 ——
+    国产内容就这么混进番号库了。
     """
     dup_sources: List[str] = Field(default_factory=lambda: ["dup", "wdup"])
     """回贴标记的取值优先级：按顺序取第一个存在的捕获组，填入 ``{dup}`` 槽位。"""
+
+    uppercase: bool = True
+    """规范名是否统一大写。
+
+    **为什么必须统一**：整理出来的库最终是要放到 exFAT 上的，而
+    exFAT / Windows NTFS / macOS APFS（默认）全都大小写不敏感 ——
+    在它们上面 ``club-810`` 与 ``CLUB-810`` 是同一个名字。
+    在大小写敏感的卷（Linux ext4）上整理出来的库，两个只差大小写的
+    目录能共存；拷到 exFAT 上就撞了。统一大写把这个问题从根上消掉，
+    而不是留给「拷贝时报错」。
+
+    **大写只作用于规范名本身**（厂牌 + 序号 + 版本后缀）：
+
+    - 扩展名原样保留（``.mp4`` 不动）—— 刮削器和播放器对扩展名大小写
+      敏感的地方不少，改它收益为零、风险不小
+    - 噪声后缀原样保留（``_en`` / ``[4K]`` 这类标记是有意义的信息）
+    - 中文标题文件一律不动 —— 那些名字是内容标识，不是番号
+    """
 
     @field_validator("exclude")
     @classmethod
@@ -140,8 +164,13 @@ class RuleSet(BaseModel):
         return v
 
     def is_excluded(self, core: str) -> bool:
-        """核心串是否命中排除名单。"""
-        return any(re.search(pattern, core) for pattern in self.exclude)
+        """核心串是否命中排除名单。
+
+        **忽略大小写**。国产编号的写法本身就没有大小写规范，
+        大写化之后如果排除名单还是大小写敏感的，国产内容会因为
+        「变成了大写形态」而漏掉排除 —— 正好和统一大写的目标相反。
+        """
+        return any(re.search(pattern, core, re.IGNORECASE) for pattern in self.exclude)
 
     def ordered_matches(self) -> List[MatchRule]:
         """按 priority 降序返回匹配规则（同优先级保持文件内顺序）。"""

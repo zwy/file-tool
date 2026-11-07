@@ -41,12 +41,13 @@ from __future__ import annotations
 import re
 from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from pydantic import BaseModel, Field
 
 from file_tool import engine
 from file_tool import fscompat
+from file_tool import naming
 from file_tool.models import RuleSet
 
 # 规范名里的数字段
@@ -89,6 +90,24 @@ class FileItem(BaseModel):
     target: str = ""
     action: FileAction = FileAction.SKIP
     reason: str = ""
+
+
+class _Candidate(BaseModel):
+    """规划阶段的一个中间态：某个文件**想要**的名字。"""
+
+    path: Path
+    desired: str
+    """规范化之后想要的名字（还不确定能不能占上）。"""
+    is_code: bool
+    """是不是解析出了番号 —— 只有解析出来的才进计划。
+
+    解析不出来的文件名本身是内容标识（中文标题、图片序列、导出名），
+    永远不动；但它**占着**自己的文件名，别人的目标名撞上它时要算进去。
+    """
+    size: int = 0
+    """文件体积 —— 同名冲突时用来决定谁占基础名。"""
+    reason: str = ""
+    """改名理由，写进 :class:`FileItem`。"""
 
 
 class FilePlan(BaseModel):
@@ -162,7 +181,8 @@ def _resolve(name: str, ruleset: RuleSet):
     dup_sources = ruleset.dup_sources or ["dup"]
     core, captured = engine.strip_noise(name, ruleset.preprocess)
     base, target, rule, _desc, _core = engine.resolve_target(
-        core, captured, ordered, ruleset.preprocess, dup_sources, ruleset.exclude
+        core, captured, ordered, ruleset.preprocess, dup_sources,
+        ruleset.exclude, ruleset.uppercase,
     )
     return base, target, rule
 
@@ -269,119 +289,272 @@ def build_file_plan(root: Path, ruleset: RuleSet) -> FilePlan:
             plan.no_code_dirs.append(child.name)
             continue
         plan.code_dirs.append(child.name)
+        _plan_directory(plan, root, child, dir_base, dir_target, ruleset)
 
-        for path in sorted(child.rglob("*")):
-            if not path.is_file():
-                # Windows 上名字非法的文件连 stat 都会失败 —— 这里如实报告
-                if fscompat.on_windows():
-                    reason = fscompat.is_windows_unsafe_name(path.name)
-                    if reason:
-                        rel = fscompat.to_posix_relpath(path, root)
-                        plan.inaccessible.append(f"{rel}（{reason}）")
-                continue
-            if path.name.startswith("._"):
-                continue  # 资源叉，交给 clean 处理
+    return plan
 
-            stem, ext = split_extension(path.name)
-            file_base, noise, _frule = split_code_suffix(stem, ruleset)
 
-            if not file_base:
-                plan.no_code_files += 1
-                continue
+def _plan_directory(
+    plan: FilePlan,
+    root: Path,
+    directory: Path,
+    dir_base: str,
+    dir_target: str,
+    ruleset: RuleSet,
+) -> None:
+    """规划一个番号目录里的文件改名。
 
-            relpath = fscompat.to_posix_relpath(path, root)
-            item = FileItem(relpath=relpath, directory=child.name, original=path.name)
+    分两步走：
 
-            if canonical_code(file_base) != canonical_code(dir_base):
-                # 不是同一部番号 —— **不能**套目录的番号。
-                #
-                # 那个名字本身就是内容标识：``OFJE-594-A.mp4`` 一眼就认得出
-                # 是 A 变体，套上目录的番号 ``OFJE-594`` 会把变体信息抹掉。
-                #
-                # 但「不动」不等于「不规范化」：文件名里带的水印域名是
-                # **纯噪声**，跟内容标识无关。所以这里用**文件自己的番号**
-                # 来规范化 —— 水印剥掉，番号本身也规范化成厂牌-序号，
-                # 变体后缀原样保留。
-                #
-                # 实测踩过的坑：H 盘 ``DVDMS-980/`` 里放的是 A/B 两个变体，
-                # 文件名是 ``hhd800.com@DVDMS-980-A.mp4``。旧逻辑整个文件
-                # 不动，水印一直留着 —— 「文件名规范化」就差这么一步。
-                new_name = file_base + noise + ext
-                if new_name == path.name:
-                    item.target = new_name
-                    item.action = FileAction.KEEP
-                    item.reason = "已是规范名"
-                    plan.items.append(item)
-                    continue
+    1. 算出每个文件**想要**的名字 —— 解析出番号的规范化成所在目录的番号，
+       解析不出的保持原样（那些名字本身就是内容标识）。
+    2. 想要同一个名字的文件**按体积**分配：最大的占基础名，其余依次
+       加 `` (2)`` / `` (3)``。
 
-                status = _target_status(path, new_name)
-                if status == "case":
-                    # 同一个文件，仅大小写不同 —— 不是冲突
-                    item.target = new_name
-                    item.action = FileAction.RENAME
-                    item.reason = "仅大小写不同"
-                    plan.items.append(item)
-                    continue
-                if status == "conflict":
-                    item.target = new_name
-                    item.action = FileAction.CONFLICT
-                    item.reason = "目标名已存在，未覆盖"
-                    plan.items.append(item)
-                    continue
+    第二步是必须的。实测 ``CLUB-806/`` 里有两个不同压制版本：
 
-                item.target = new_name
-                item.action = FileAction.RENAME
-                item.reason = f"文件名是别的番号（{file_base}），按它自己的番号规范化"
-                plan.items.append(item)
-                continue
+    ================================  ==========  ==================
+    原名                               体积        规范化后想要
+    ================================  ==========  ==================
+    ``CLUB-806C.mp4``                  1.19 GB     ``CLUB-806C.mp4``
+    ``CLUB806C.mp4``                   2.23 GB     ``CLUB-806C.mp4``
+    ================================  ==========  ==================
 
+    两个都想要 ``CLUB-806C.mp4``。谁占着这个名字？**大的那份** ——
+    它的画质通常更好，让它占着规范名是合理的默认；小的改名
+    ``CLUB-806C (2).mp4``，两份都留着，谁都不覆盖。
+    """
+    candidates: List[_Candidate] = []
+
+    for path in sorted(directory.rglob("*")):
+        if not path.is_file():
+            # Windows 上名字非法的文件连 stat 都会失败 —— 这里如实报告
+            if fscompat.on_windows():
+                reason = fscompat.is_windows_unsafe_name(path.name)
+                if reason:
+                    rel = fscompat.to_posix_relpath(path, root)
+                    plan.inaccessible.append(f"{rel}（{reason}）")
+            continue
+        if path.name.startswith("._"):
+            continue  # 资源叉，交给 clean 处理
+
+        stem, ext = split_extension(path.name)
+        file_base, noise, _frule = split_code_suffix(stem, ruleset)
+
+        if not file_base:
+            plan.no_code_files += 1
+            # 不参与番号规范化，但它**占着**自己的文件名 ——
+            # 别人的目标名撞上它时要算进去。
+            candidates.append(
+                _Candidate(
+                    path=path,
+                    desired=path.name,
+                    is_code=False,
+                    size=_file_size(path),
+                )
+            )
+            continue
+
+        if canonical_code(file_base) == canonical_code(dir_base):
             # 目录名自带的重复标记（如 ``CLUB-880 (2)``）已经体现在
             # ``dir_target`` 里了。文件名里的同一个标记不能再加一遍 ——
             # 否则会拼出 ``CLUB-880 (2) (2).mp4`` 这种重复后缀。
             # 目录没有标记时（``sdjs-361``），文件自己的分段标记
             # （``-2``）要留着 —— 那是区分不同分段的唯一信息。
-            dir_marker = dir_target[len(dir_base):] if dir_target.startswith(dir_base) else ""
-            if dir_marker and noise.startswith(dir_marker):
-                noise = noise[len(dir_marker):]
-
-            new_name = dir_target + noise + ext
-            if new_name == path.name:
-                item.target = new_name
-                item.action = FileAction.KEEP
-                item.reason = "已是规范名"
-                plan.items.append(item)
-                continue
-
-            # 冲突检测不能用 ``Path.exists()`` ——
-            # exFAT / APFS（默认）大小写不敏感，``CLUB-880.mp4`` 和
-            # ``club-880.mp4`` 指的是**同一个文件**，exists() 恒为真；
-            # 而 Linux ext4 上恒为假。同一个库在两种卷上会得到不同结果，
-            # 整理完再拷到 exFAT 就撞名了。
+            marker = dir_target[len(dir_base):] if dir_target.startswith(dir_base) else ""
+            if marker and noise.startswith(marker):
+                noise = noise[len(marker):]
+            desired = dir_target + noise + ext
+            reason = "番号规范化"
+        else:
+            # 不是同一部番号 —— **不能**套目录的番号。
             #
-            # 真正的冲突是「另一个文件占了目标名」。判定靠文件身份
-            # （inode + 设备号），同一个文件只是大小写不同 -> 那是
-            # 纯大小写改名，走两步 rename，不算冲突。
-            status = _target_status(path, new_name)
-            if status == "case":
-                # 同一个文件，仅大小写不同 —— 不是冲突
-                item.target = new_name
-                item.action = FileAction.RENAME
-                item.reason = "仅大小写不同"
-                plan.items.append(item)
-                continue
-            if status == "conflict":
-                item.target = new_name
-                item.action = FileAction.CONFLICT
-                item.reason = "目标名已存在，未覆盖"
-                plan.items.append(item)
-                continue
+            # 那个名字本身就是内容标识：``OFJE-594-A.mp4`` 一眼就认得出
+            # 是 A 变体，套上目录的番号 ``OFJE-594`` 会把变体信息抹掉。
+            #
+            # 但「不动」不等于「不规范化」：文件名里带的水印域名是
+            # **纯噪声**，跟内容标识无关。所以这里用**文件自己的番号**
+            # 来规范化 —— 水印剥掉，番号本身也规范化成厂牌-序号，
+            # 变体后缀原样保留。
+            #
+            # 实测踩过的坑：H 盘 ``DVDMS-980/`` 里放的是 A/B 两个变体，
+            # 文件名是 ``hhd800.com@DVDMS-980-A.mp4``。旧逻辑整个文件
+            # 不动，水印一直留着 —— 「文件名规范化」就差这么一步。
+            desired = file_base + noise + ext
+            reason = f"文件名是别的番号（{file_base}），按它自己的番号规范化"
 
-            item.target = new_name
-            item.action = FileAction.RENAME
-            item.reason = "番号规范化"
-            plan.items.append(item)
+        candidates.append(
+            _Candidate(
+                path=path,
+                desired=desired,
+                is_code=True,
+                size=_file_size(path),
+                reason=reason,
+            )
+        )
 
-    return plan
+    # ---- 按想要的名字分组，组内按体积分配 ----
+    groups: Dict[str, List[int]] = {}
+    for idx, cand in enumerate(candidates):
+        groups.setdefault(fscompat.same_name_key(cand.desired), []).append(idx)
+
+    for idxs in groups.values():
+        group = [candidates[i] for i in idxs]
+        # 同一组里的名字只差大小写时，取**全大写**的那个当规范拼写 ——
+        # 统一大写之后，规范名就该是大写形态。
+        base = _canonical_spelling([c.desired for c in group])
+        # 组外占用的名字：组员自己不算（它们会被重新分配），
+        # 组外的名字先当成占着 —— 宁可序号跳一个，也不撞名。
+        group_ids = set(idxs)
+        taken = [
+            c.path.name
+            for i, c in enumerate(candidates)
+            if i not in group_ids
+        ]
+        finals = _allocate_by_size(group, base, taken)
+        # 组内每个成员的最终去向 —— 后面判断「谁会腾位置」要用
+        placements = {id(c): f for c, f in zip(group, finals)}
+        for cand, final in zip(group, finals):
+            if not cand.is_code:
+                continue
+            _add_item(plan, root, cand, final, group, placements)
+
+
+def _canonical_spelling(names: Sequence[str]) -> str:
+    """同一组里的名字挑一个「规范拼写」—— 优先全大写。"""
+    upper = sorted(n for n in names if n == n.upper())
+    if upper:
+        return upper[0]
+    return sorted(names)[0]
+
+
+def _allocate_by_size(
+    group: Sequence[_Candidate],
+    base: str,
+    taken: Sequence[str],
+) -> List[str]:
+    """给一组「想要同一个名字」的候选分配最终名字。
+
+    体积大的占基础名，其余按体积降序依次拿 `` (2)`` / `` (3)``。
+    返回值与 ``group`` 一一对应。
+    """
+    used = {t.casefold() for t in taken}
+    finals: List[Optional[str]] = [None] * len(group)
+
+    # 体积降序；体积相同按想要的字面量定序，保证结果稳定可复现
+    order = sorted(
+        range(len(group)),
+        key=lambda i: (-group[i].size, group[i].desired),
+    )
+
+    winner = order[0]
+    finals[winner] = base
+    used.add(base.casefold())
+
+    index = 2
+    for i in order[1:]:
+        while True:
+            candidate = naming.numbered_name(base, index)
+            if candidate.casefold() not in used:
+                break
+            index += 1
+        finals[i] = candidate
+        used.add(candidate.casefold())
+        index += 1
+
+    return [f if f is not None else base for f in finals]
+
+
+def _add_item(
+    plan: FilePlan,
+    root: Path,
+    cand: _Candidate,
+    final: str,
+    group: Sequence[_Candidate],
+    placements: Dict[int, str],
+) -> None:
+    """把分配好的最终名字写进计划。"""
+    path = cand.path
+    relpath = fscompat.to_posix_relpath(path, root)
+    item = FileItem(
+        relpath=relpath,
+        directory=path.parent.name,
+        original=path.name,
+        target=final,
+    )
+
+    if final == path.name:
+        item.action = FileAction.KEEP
+        item.reason = "已是规范名"
+        plan.items.append(item)
+        return
+
+    # 冲突检测不能用 ``Path.exists()`` ——
+    # exFAT / APFS（默认）大小写不敏感，``CLUB-880.mp4`` 和
+    # ``club-880.mp4`` 指的是**同一个文件**，exists() 恒为真；
+    # 而 Linux ext4 上恒为假。同一个库在两种卷上会得到不同结果，
+    # 整理完再拷到 exFAT 上就撞名了。
+    #
+    # 真正的冲突是「另一个文件占了目标名」。判定靠文件身份
+    # （inode + 设备号），同一个文件只是大小写不同 -> 那是
+    # 纯大小写改名，走两步 rename，不算冲突。
+    blockers = fscompat.colliding_entries(path.parent, final)
+    real = [b for b in blockers if not _will_vacate(b, path, group, placements)]
+    if real:
+        item.action = FileAction.CONFLICT
+        item.reason = "目标名已存在，未覆盖"
+        plan.items.append(item)
+        return
+
+    if final.lower() == path.name.lower():
+        # 同一个文件，仅大小写不同 —— 不是冲突
+        item.action = FileAction.RENAME
+        item.reason = "仅大小写不同"
+        plan.items.append(item)
+        return
+
+    item.action = FileAction.RENAME
+    item.reason = cand.reason
+    plan.items.append(item)
+
+
+def _will_vacate(
+    blocker: Path,
+    path: Path,
+    group: Sequence[_Candidate],
+    placements: Dict[int, str],
+) -> bool:
+    """这个占用者会不会在本次执行中腾出位置。
+
+    两种情况算「会腾」：
+
+    - 它就是源文件自己（仅大小写不同）
+    - 它是同组的一员，而且**也会改名** —— 同一组里想要同一个名字的
+      文件按体积分配，大的占基础名、小的改成 `` (2)``。占着基础名的
+      那份如果自己要让位，位置就空出来了。
+
+    关键在这一条：实测 ``CLUB-806/`` 里 ``CLUB806C.mp4``（2.23 GB）
+    想要 ``CLUB-806C.mp4``，而那个名字此刻正被 ``CLUB-806C.mp4``
+    （1.19 GB）占着 —— 后者会被改成 ``CLUB-806C (2).mp4`` 让位，
+    所以前者不是冲突。
+    """
+    if fscompat.is_same_file(path, blocker):
+        return True
+    for cand in group:
+        if cand.path.name.lower() != blocker.name.lower():
+            continue
+        final = placements.get(id(cand), "")
+        return final.lower() != cand.path.name.lower()
+    return False
+
+
+def _file_size(path: Path) -> int:
+    """文件体积；拿不到就当 0（不影响正确性，只影响谁占基础名）。"""
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
 
 
 def _rename_case_only(src: Path, dst: Path) -> None:
@@ -426,38 +599,94 @@ def _target_status(path: Path, new_name: str) -> str:
 
 
 def apply_file_plan(root: Path, plan: FilePlan) -> Dict[str, object]:
-    """执行文件改名。冲突绝不覆盖。"""
+    """执行文件改名。冲突绝不覆盖。
+
+    **执行顺序有讲究**
+    ------------------
+    同一组里「大的那份」占着基础名，「小的那份」改名 `` (2)``。
+    但那个基础名此刻可能**正被小的这份占着** —— 大的要等小的让位
+    才能改名成功。实测 ``CLUB-806/``：
+
+    ==========================================  ==========
+    计划                                        磁盘现状
+    ==========================================  ==========
+    ``CLUB806C.mp4``  -> ``CLUB-806C.mp4``      目标名被占
+    ``CLUB-806C.mp4`` -> ``CLUB-806C (2).mp4``  先让位
+    ==========================================  ==========
+
+    所以这里不是按计划顺序一股脑改，而是**先改「让位」的那份**：
+    目标名被别人占着、而占着的那个人也在计划里改名的，就先处理他。
+    反复几轮直到没有进展，剩下的就是真冲突。
+    """
     renamed: List[tuple[str, str]] = []
     # 计划阶段就判定的冲突也算数 —— 它们虽然不在 rename_items 里，
     # 但用户需要知道哪些文件因为「目标已存在」而没被规范化
     conflicts: List[str] = [i.relpath for i in plan.conflict_items]
     failed: List[str] = []
 
-    for item in plan.rename_items:
-        src = root / item.relpath
-        if not src.is_file():
-            continue
-        dst = src.parent / item.target
+    pending = list(plan.rename_items)
+    while pending:
+        deferred: List[FileItem] = []
+        progressed = False
 
-        # 目标名是否被占用 —— 忽略大小写判定，见 fscompat.colliding_entries
-        blockers = fscompat.colliding_entries(src.parent, item.target)
-        if blockers:
-            # 目标已存在 —— 只有「同一个文件、仅大小写不同」才继续
-            if all(fscompat.is_same_file(src, b) for b in blockers):
-                _rename_case_only(src, dst)
-                renamed.append((item.relpath, item.target))
+        for item in pending:
+            src = root / item.relpath
+            if not src.is_file():
+                progressed = True
                 continue
-            conflicts.append(item.relpath)
-            continue
+            dst = src.parent / item.target
 
-        try:
-            src.rename(dst)
-            renamed.append((item.relpath, item.target))
-        except OSError:
-            failed.append(item.relpath)
+            # 目标名是否被占用 —— 忽略大小写判定，见 fscompat.colliding_entries
+            blockers = fscompat.colliding_entries(src.parent, item.target)
+            waiting = [
+                b for b in blockers
+                if not fscompat.is_same_file(src, b)
+                and _will_be_renamed_away(b, pending)
+            ]
+            if waiting:
+                # 占着目标名的那个人自己也要改名 —— 先让他走
+                deferred.append(item)
+                continue
+
+            progressed = True
+            if blockers:
+                # 目标已存在 —— 只有「同一个文件、仅大小写不同」才继续
+                if all(fscompat.is_same_file(src, b) for b in blockers):
+                    _rename_case_only(src, dst)
+                    renamed.append((item.relpath, item.target))
+                    continue
+                conflicts.append(item.relpath)
+                continue
+
+            try:
+                src.rename(dst)
+                renamed.append((item.relpath, item.target))
+            except OSError:
+                failed.append(item.relpath)
+
+        if not progressed:
+            # 互相等对方让位 —— 循环依赖，实测不会出现。
+            # 判成冲突，绝不覆盖。
+            for item in deferred:
+                conflicts.append(item.relpath)
+            break
+        pending = deferred
 
     return {
         "renamed": renamed,
         "conflicts": conflicts,
         "failed": failed,
     }
+
+
+def _will_be_renamed_away(blocker: Path, pending: Sequence[FileItem]) -> bool:
+    """这个占用者会不会在本次执行中改名走掉。
+
+    它自己就是计划里的一项、而且目标名和现在不同 —— 那它迟早会让位。
+    """
+    for item in pending:
+        if item.original.lower() != blocker.name.lower():
+            continue
+        if item.target.lower() != item.original.lower():
+            return True
+    return False

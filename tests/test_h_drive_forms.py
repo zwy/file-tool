@@ -234,14 +234,14 @@ def test_part_marker_is_not_swallowed(ruleset):
     取截断结果 —— 被剥掉的标记就回到后缀里，不会消失。
     """
     base, noise, _rule = rf.split_code_suffix("sdjs-361-2", ruleset)
-    assert base == "sdjs-361"
+    assert base == "SDJS-361"
     assert noise == "-2"
 
 
 def test_part_marker_is_kept_with_language_suffix(ruleset):
     """``sdjs-361-2.ja`` 的 ``-2`` 同样要留住。"""
     base, noise, _rule = rf.split_code_suffix("sdjs-361-2.ja", ruleset)
-    assert base == "sdjs-361"
+    assert base == "SDJS-361"
     assert noise == "-2.ja"
 
 
@@ -285,17 +285,26 @@ def test_variant_file_uses_its_own_code(ruleset, tmp_path):
 
 
 def test_variant_file_conflict_is_not_overwritten(ruleset, tmp_path):
-    """变体文件剥掉水印后撞上同名文件 -> 报冲突，绝不覆盖。"""
+    """变体文件剥掉水印后撞上同名文件 -> 两份都留着，绝不覆盖。"""
     from file_tool import rename_files as rf_mod
 
     (tmp_path / "OFJE-697").mkdir()
     (tmp_path / "OFJE-697" / "hhd800.com@OFJE-697-A.mp4").write_bytes(b"x")
-    (tmp_path / "OFJE-697" / "OFJE-697-A.mp4").write_bytes(b"x")
+    (tmp_path / "OFJE-697" / "OFJE-697-A.mp4").write_bytes(b"y" * 10)
 
     plan = rf_mod.build_file_plan(tmp_path, ruleset)
-    assert plan.rename_items == []
-    assert len(plan.conflict_items) == 1
-    assert plan.conflict_items[0].target == "OFJE-697-A.mp4"
+    # 大的是已在位的那个，它占着规范名；小的加序号
+    item = next(i for i in plan.items if i.original == "hhd800.com@OFJE-697-A.mp4")
+    assert item.action is rf.FileAction.RENAME
+    assert item.target == "OFJE-697-A (2).mp4"
+
+    result = rf_mod.apply_file_plan(tmp_path, plan)
+    assert not result["conflicts"]
+    kept = {p.name: p.read_bytes() for p in (tmp_path / "OFJE-697").iterdir()}
+    assert kept == {
+        "OFJE-697-A.mp4": b"y" * 10,
+        "OFJE-697-A (2).mp4": b"x",
+    }
 
 
 # --------------------------------------------------------------------------

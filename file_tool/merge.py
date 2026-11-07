@@ -30,11 +30,12 @@ import re
 import shutil
 from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from pydantic import BaseModel, Field
 
 from file_tool import fscompat
+from file_tool import naming
 from file_tool.models import RuleSet
 
 # 指纹读取的字节数：首尾各读这么多，避免为几十 GB 的视频做全量哈希
@@ -304,7 +305,8 @@ def _resolve_base(
     """
     core, captured = engine_mod.strip_noise(name, ruleset.preprocess)
     base, _target, _rule, _desc, _core = engine_mod.resolve_target(
-        core, captured, ordered, ruleset.preprocess, dup_sources, ruleset.exclude
+        core, captured, ordered, ruleset.preprocess, dup_sources,
+        ruleset.exclude, ruleset.uppercase,
     )
     if base:
         return base
@@ -317,7 +319,8 @@ def _resolve_base(
 
     core2, captured2 = engine_mod.strip_noise(stripped, ruleset.preprocess)
     base2, _t, _r, _d, _c = engine_mod.resolve_target(
-        core2, captured2, ordered, ruleset.preprocess, dup_sources, ruleset.exclude
+        core2, captured2, ordered, ruleset.preprocess, dup_sources,
+        ruleset.exclude, ruleset.uppercase,
     )
     return base2 or ""
 
@@ -325,35 +328,30 @@ def _resolve_base(
 def apply_merge_plan(
     root: Path,
     plan: MergePlan,
-    only_duplicates: bool = True,
+    only_duplicates: bool = False,
 ) -> List[Dict[str, object]]:
     """执行合并。
 
-    ``only_duplicates=True``（默认）时，只合并内容完全一致的组。
-    内容不同的组一律不动 —— 那多半是不同版本或分P，合并会丢数据。
+    **默认一律合并** —— 用户定的规则是「遇到重名文件夹保留一个，
+    文件挪进去文件夹里」。内容不同的组也并进去，靠「按体积分配」
+    解决文件级的撞名（见 :func:`_merge_into`）。
+
+    ``only_duplicates=True`` 是**保守模式**：只合并内容完全一致的组，
+    内容不同/部分重叠的组各自保留。这是给「不确定能不能并」时留的
+    退路，不是默认行为。
 
     返回每个目录的处置明细。
     """
     results: List[Dict[str, object]] = []
 
     for group in plan.groups:
-        if group.verdict is MergeVerdict.DIFFERENT:
+        if only_duplicates and group.verdict is not MergeVerdict.DUPLICATE:
             for d in group.dirs:
                 results.append({
                     "base": group.base,
                     "dir": d,
                     "action": MergeAction.SKIP.value,
                     "reason": group.detail,
-                })
-            continue
-
-        if group.verdict is MergeVerdict.PARTIAL and only_duplicates:
-            for d in group.dirs:
-                results.append({
-                    "base": group.base,
-                    "dir": d,
-                    "action": MergeAction.SKIP.value,
-                    "reason": "部分重叠，保守模式不处理",
                 })
             continue
 
@@ -372,41 +370,56 @@ def apply_merge_plan(
             if not other_dir.exists():
                 continue
 
-            moved, skipped, failed = _merge_into(other_dir, primary_dir)
+            moved, failed, deduped = _merge_into(other_dir, primary_dir)
             results.append({
                 "base": group.base,
                 "dir": other,
                 "action": MergeAction.MERGE.value,
                 "moved": moved,
-                "skipped": skipped,
                 "failed": failed,
+                "deduped": deduped,
                 "reason": f"并入 {group.primary}",
             })
 
-            # 副本目录已空 -> 删除；仍有残留（冲突文件）-> 保留
+            # 副本目录已空 -> 删除；仍有残留（搬不动的文件）-> 保留
             _remove_if_empty(other_dir)
 
     return results
 
 
-def _merge_into(src: Path, dst: Path) -> Tuple[List[str], List[str], List[str]]:
+def _merge_into(
+    src: Path, dst: Path
+) -> Tuple[List[str], List[str], List[str]]:
     """把 src 下的文件并入 dst。
 
-    - 目标不存在 → 移动过去
-    - 目标存在且内容相同 → 删掉源文件（真重复）
-    - 目标存在但内容不同 → 保留源文件，记为冲突（绝不覆盖）
-    - **文件被占用 / 无权限 → 记为失败，继续处理下一个**
+    三种情况，**任何一种都不丢数据**：
+
+    - **内容相同**（不论文件名是否相同）-> 只留一份，删掉源文件。
+      实测 ``DVMM-055A`` 与 ``DVMM-055A (1)`` 里的封面 jpg 是字节一致的
+      两份 —— 合并后只该留一份。
+    - **目标名没被占** -> 移动过去
+    - **目标名被占但内容不同** -> 按**体积**分配：大的那份占着规范名，
+      小的那份改名 `` (2)``。实测 ``CLUB-806/`` 里
+      ``CLUB-806C.mp4``（1.19 GB）和 ``CLUB806C.mp4``（2.23 GB）
+      是同一部片子的两个压制版本 —— 大的通常画质更好，让它占规范名
+      是合理的默认，两份都留着。
+
+    - **文件被占用 / 无权限** -> 记为失败，继续处理下一个
 
     最后一条是 Windows 上必须有的：macOS 允许删改正在打开的文件，
     Windows 不允许 —— 资源管理器预览窗、播放器、杀毒软件都可能占着。
     没有这条兜底，一个被占用的文件就会让整次合并抛异常中断，
     留下「并了一半」的目录。
 
-    返回 (已并入的文件, 被保留的冲突文件, 失败的文件)。
+    返回 (已并入的文件, 失败的文件, 内容重复被丢弃的文件)。
     """
     moved: List[str] = []
-    skipped: List[str] = []
     failed: List[str] = []
+    deduped: List[str] = []
+
+    # dst 里已有文件的内容指纹 —— 用来判「内容相同，只留一份」。
+    # 这层去重不看文件名：两份内容一致的封面不该在合并后还留两份。
+    known_digests = _digest_index(dst)
 
     for path in sorted(src.rglob("*")):
         try:
@@ -424,6 +437,17 @@ def _merge_into(src: Path, dst: Path) -> Tuple[List[str], List[str], List[str]]:
                 failed.append(rel_str)
             continue
 
+        digest = _safe_digest(path)
+
+        # 内容相同 -> 只留一份（文件名不同也照样）
+        if digest and digest in known_digests:
+            try:
+                path.unlink()
+                deduped.append(rel_str)
+            except OSError:
+                failed.append(rel_str)
+            continue
+
         target = dst / rel
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -431,33 +455,110 @@ def _merge_into(src: Path, dst: Path) -> Tuple[List[str], List[str], List[str]]:
             failed.append(rel_str)
             continue
 
-        try:
-            # 目标名是否被占用 —— **忽略大小写**判定（见 fscompat.colliding_entries）。
-            # 不能用 target.exists()：那取决于卷的大小写语义，在大小写敏感的
-            # 卷上会漏判，把两个只差大小写的文件当成「不重名」并进去 ——
-            # 等库拷到 exFAT 上就撞名了。
-            blockers = fscompat.colliding_entries(target.parent, target.name)
-            if not blockers:
+        # 目标名是否被占用 —— **忽略大小写**判定（见 fscompat.colliding_entries）。
+        # 不能用 target.exists()：那取决于卷的大小写语义，在大小写敏感的
+        # 卷上会漏判，把两个只差大小写的文件当成「不重名」并进去 ——
+        # 等库拷到 exFAT 上就撞名了。
+        blockers = fscompat.colliding_entries(target.parent, target.name)
+        if not blockers:
+            try:
                 shutil.move(str(path), str(target))
-                moved.append(rel_str)
+            except OSError:
+                failed.append(rel_str)
                 continue
+            moved.append(rel_str)
+            if digest:
+                known_digests.add(digest)
+            continue
 
-            # 已存在同名文件：内容相同 -> 删掉源文件（真重复）
-            #                 内容不同 -> 保留源文件，记为冲突（绝不覆盖）
-            duplicate = False
+        # 同名但内容不同 -> 按体积分配：大的占规范名，小的让位
+        incoming_size = _safe_size(path)
+        blocker_sizes = [_safe_size(b) for b in blockers]
+        taken = {p.name.casefold() for p in target.parent.iterdir() if p.is_file()}
+        # **规范名取占用者现在的名字** —— 那个名字已经在这个目录里立住了，
+        # 是这个位置上的「正式名」。源文件那个相对路径里的名字只是个
+        # 候选（可能是 ``a.mp4`` 这种大小写不同的写法）。
+        canonical = blockers[0].name
+
+        if incoming_size > max(blocker_sizes, default=0):
+            # 进来的这份最大 -> 占用者全部让位，规范名归它
             for blocker in blockers:
-                if file_digest(blocker) == file_digest(path):
-                    duplicate = True
+                yield_name = _yield_name(canonical, taken)
+                taken.add(yield_name.casefold())
+                try:
+                    blocker.rename(target.parent / yield_name)
+                except OSError:
+                    failed.append(rel_str)
                     break
-            if duplicate:
-                path.unlink()
-                moved.append(rel_str)
-            else:
-                skipped.append(rel_str)
-        except OSError:
-            failed.append(rel_str)
+            try:
+                shutil.move(str(path), str(target.parent / canonical))
+            except OSError:
+                failed.append(rel_str)
+                continue
+            moved.append(rel_str)
+        else:
+            # 占用者不比它小（相等时也优先让已经就位的那份留下）->
+            # 进来的这份改名
+            yield_name = _yield_name(canonical, taken)
+            try:
+                shutil.move(str(path), str(target.parent / yield_name))
+            except OSError:
+                failed.append(rel_str)
+                continue
+            moved.append(rel_str)
 
-    return moved, skipped, failed
+        if digest:
+            known_digests.add(digest)
+
+    return moved, failed, deduped
+
+
+def _yield_name(name: str, taken: Set[str]) -> str:
+    """给撞名的文件找一个让位后的名字：``X.mp4`` -> ``X (2).mp4``。
+
+    ``taken`` 是目标目录里已被占用的名字（**小写化**后的比较键）。
+    """
+    index = 2
+    while True:
+        candidate = naming.numbered_name(name, index)
+        if candidate.casefold() not in taken:
+            return candidate
+        index += 1
+
+
+def _safe_digest(path: Path) -> str:
+    """内容指纹；算不出来就返回空串（当作「无法判断」）。"""
+    try:
+        return file_digest(path)
+    except OSError:
+        return ""
+
+
+def _safe_size(path: Path) -> int:
+    """文件体积；拿不到就当 0。"""
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+def _digest_index(root: Path) -> Set[str]:
+    """目录下所有文件的内容指纹集合。"""
+    digests: Set[str] = set()
+    for path in sorted(root.rglob("*")):
+        try:
+            if not path.is_file():
+                continue
+        except OSError:
+            continue
+        rel = path.relative_to(root)
+        if _is_hidden(rel):
+            continue
+        digest = _safe_digest(path)
+        if digest:
+            digests.add(digest)
+    return digests
+
 
 
 def _remove_if_empty(path: Path) -> None:

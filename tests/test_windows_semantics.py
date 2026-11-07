@@ -74,8 +74,8 @@ def test_merge_skips_locked_file_and_continues(ruleset, tmp_path, monkeypatch):
     merge_results = [r for r in results if r["action"] == "merge"]
     assert len(merge_results) == 1
     result = merge_results[0]
-    # 内容相同的直接删掉副本那份
-    assert "shared.mp4" in result["moved"]
+    # 内容相同的直接删掉副本那份（只留一份）
+    assert "shared.mp4" in result["deduped"]
     # 搬不动的记为失败
     assert "only-b.mp4" in result["failed"]
     # 关键：副本目录因为还有残留而保留，主目录内容没丢

@@ -170,6 +170,7 @@ def _match_core(
     captured: Dict[str, str],
     matches: Sequence[MatchRule],
     dup_sources: Sequence[str] = ("dup",),
+    uppercase: bool = True,
 ) -> Optional[Tuple[str, str, str, str]]:
     """在核心串上匹配番号规则。
 
@@ -177,6 +178,11 @@ def _match_core(
 
     基础名 = 不含重复副本标记的规范名，是「同一作品」的判定键；
     完整目标名 = 基础名 + 回贴的重复标记，是实际落盘用的名字。
+
+    ``uppercase=True`` 时规范名统一大写。**大写只作用于这里渲染出来的
+    规范名**，不影响噪声剥离 —— 剥离规则里有好几条是靠「域名小写、
+    番号大写」把两段切开的，先大写会把它们全切不开（详见
+    :func:`resolve_target` 的注释）。
     """
     for rule in matches:
         match = rule.compiled().fullmatch(core)
@@ -188,6 +194,8 @@ def _match_core(
         if dup is not None:
             values["dup"] = dup
         base = _render(rule.template, values)
+        if uppercase:
+            base = base.upper()
         target = base
         if rule.dup_suffix is not None and dup is not None:
             target = base + _render(rule.dup_suffix, values)
@@ -211,6 +219,7 @@ def resolve_target(
     preprocess: Sequence[PreprocessRule] = (),
     dup_sources: Sequence[str] = ("dup",),
     exclude: Sequence[str] = (),
+    uppercase: bool = True,
 ) -> Tuple[Optional[str], str, str, str, str]:
     """在核心串上匹配番号规则。
 
@@ -220,18 +229,38 @@ def resolve_target(
 
     ``exclude`` 是永不视为番号的名称形态（见 :attr:`RuleSet.exclude`）。
     命中时直接返回「不匹配」—— 国产内容的编号（如 ``FLUP-1131428``）
-    因此不会被套上番号规范。
+    因此不会被套上番号规范。排除**忽略大小写**，否则统一大写之后
+    国产内容会因为「变成大写形态」而漏掉排除。
+
+    ``uppercase=True`` 时规范名统一大写。
+
+    **大写必须发生在噪声剥离之后**
+    --------------------------------
+    剥离规则里有好几条是靠「域名小写、番号大写」把两段切开的：
+
+    ==========================================  ======================
+    形态                                         靠什么切开
+    ==========================================  ======================
+    ``dxxdom.comSONE815`` -> ``SONE-815``      域名小写 / 番号大写
+    ``SDMM128Caavv38.xyz@`` -> ``SDMM-128C``   番号大写 / 域名小写
+    ``aavv38.xyz@SDMM028`` -> ``SDMM-028``     域名小写 / 番号大写
+    ==========================================  ======================
+
+    先大写，这三种形态全部切不开 —— ``DXXDOM.COMSONE815`` 会被当成
+    一个整体，规则匹配不上，整串解析失败。所以大写只加在**渲染出来
+    的规范名**上（见 :func:`_match_core`），剥离阶段一个字都不动。
 
     条件剥离规则的判定逻辑：
     **只有在基准匹配不上时才尝试条件剥离** —— 否则剥离结果会覆盖掉正确的解析，
     把已经规范的目录改坏（详见下方注释）。
     这样 ``DOW24072205-2`` 会剥掉 ``-2``，而 ``MAAN-961`` 保持原样。
     """
-    # 排除名单优先于一切匹配：国产内容的编号不该被套番号规范
-    if exclude and any(re.search(pattern, core) for pattern in exclude):
+    # 排除名单优先于一切匹配：国产内容的编号不该被套番号规范。
+    # 忽略大小写 —— 见 docstring。
+    if exclude and any(re.search(pattern, core, re.IGNORECASE) for pattern in exclude):
         return None, "", "", "命中排除名单（非番号形态）", core
 
-    baseline = _match_core(core, captured, matches, dup_sources)
+    baseline = _match_core(core, captured, matches, dup_sources, uppercase)
 
     # 条件剥离**只在基准匹配不上时才尝试**。
     # 这是关键：`DOW-240706-24` 本身就能被日期型规则正确解析，
@@ -252,7 +281,7 @@ def resolve_target(
             new_captured = dict(captured)
             if rule.capture and value:
                 new_captured[rule.capture] = value
-            candidate = _match_core(new_core, new_captured, matches, dup_sources)
+            candidate = _match_core(new_core, new_captured, matches, dup_sources, uppercase)
             if candidate is None:
                 continue
             core = new_core
@@ -276,22 +305,32 @@ def build_plan(
     ``existing`` 是根目录下已存在的全部条目名（含待改名目录本身），
     用于检测目标名冲突。
     """
-    existing_set = set(existing) if existing is not None else set(names)
-    # 冲突判定一律**忽略大小写**。规则模板保留厂牌的原始大小写
-    # （club810 -> club-810、CLUB810 -> CLUB-810），两个目标只差大小写，
-    # 在 exFAT 上是同一个名字。判定交给文件系统的话，在大小写敏感的
-    # 卷上会漏判，整理完再拷到 exFAT 就撞名了。
-    existing_keys = {fscompat.same_name_key(n) for n in existing_set}
+    existing_names = list(existing) if existing is not None else list(names)
+    # 冲突判定一律**忽略大小写**。规范名统一大写之后，理论上两个目标
+    # 不会只差大小写 —— 但输入的名字可以是任意大小写（`avop-235-C`
+    # 规范化成 `AVOP-235-C`），在 exFAT 上它们是同一个名字。
+    # 判定交给文件系统的话，在大小写敏感的卷上会漏判，整理完再拷到
+    # exFAT 就撞名了。
+    #
+    # 索引**保留重数**，这是「纯大小写改名」和「真撞名」的分界：
+    # 目标名对应的位置上只有源自己（`avop-235-C` -> `AVOP-235-C`）时，
+    # 那不是冲突，是一次纯大小写改名；而旁边还站着另一个条目
+    # （大小写敏感的卷上 `avop-235-C` 与 `AVOP-235-C` 同时存在）
+    # 时才是真撞名。
+    existing_index: Dict[str, List[str]] = {}
+    for n in existing_names:
+        existing_index.setdefault(fscompat.same_name_key(n), []).append(n)
     ordered = ruleset.ordered_matches()
     dup_sources = ruleset.dup_sources or ["dup"]
+    uppercase = ruleset.uppercase
     items: List[PlanItem] = []
-    planned: Dict[str, str] = {}  # 目标名 -> 原始名，检测批次内重名
-    planned_keys: Dict[str, str] = {}  # 同上，但忽略大小写
+    planned_keys: Dict[str, List[str]] = {}  # 目标名 -> 原始名列表，检测批次内重名
 
     for name in names:
         core, captured = strip_noise(name, ruleset.preprocess)
         base, target, rule_name, desc, final_core = resolve_target(
-            core, captured, ordered, ruleset.preprocess, dup_sources, ruleset.exclude
+            core, captured, ordered, ruleset.preprocess, dup_sources,
+            ruleset.exclude, uppercase,
         )
 
         if not target:
@@ -321,7 +360,13 @@ def build_plan(
             )
             continue
 
-        if fscompat.same_name_key(target) in existing_keys and target != name:
+        target_key = fscompat.same_name_key(target)
+        blockers = existing_index.get(target_key, [])
+        # 目标名被**别的**条目占着 -> 真冲突。
+        # 只有源自己占着（目标名与原名只差大小写）时不是冲突 ——
+        # 那是一次纯大小写改名，走 apply_plan 的两步 rename 即可。
+        others = [b for b in blockers if b != name]
+        if others and target != name:
             items.append(
                 PlanItem(
                     original=name,
@@ -335,7 +380,7 @@ def build_plan(
             )
             continue
 
-        if fscompat.same_name_key(target) in planned_keys:
+        if target_key in planned_keys:
             items.append(
                 PlanItem(
                     original=name,
@@ -344,13 +389,12 @@ def build_plan(
                     base=base or target,
                     action=Action.CONFLICT,
                     rule=rule_name,
-                    reason=f"与 {planned_keys[fscompat.same_name_key(target)]} 目标名重复",
+                    reason=f"与 {planned_keys[target_key][0]} 目标名重复",
                 )
             )
             continue
 
-        planned[target] = name
-        planned_keys[fscompat.same_name_key(target)] = name
+        planned_keys.setdefault(target_key, []).append(name)
         items.append(
             PlanItem(
                 original=name,

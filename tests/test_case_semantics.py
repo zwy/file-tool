@@ -80,7 +80,7 @@ def test_same_name_key_is_case_insensitive():
 
 
 def test_build_plan_treats_case_variant_target_as_conflict(tmp_path, ruleset):
-    """``club810`` 的目标名是 ``club-810``；已存在 ``CLUB-810`` -> 冲突。
+    """``club810`` 的目标名是 ``CLUB-810``；已存在 ``CLUB-810`` -> 冲突。
 
     两者在 exFAT 上是同一个名字。旧实现按字符串比，在大小写敏感的卷上
     会判成「不冲突」，整理完再拷到 exFAT 就撞名。
@@ -90,7 +90,41 @@ def test_build_plan_treats_case_variant_target_as_conflict(tmp_path, ruleset):
     )
 
     assert plan.items[0].action is Action.CONFLICT
-    assert plan.items[0].target == "club-810"
+    assert plan.items[0].target == "CLUB-810"
+
+
+def test_build_plan_treats_source_itself_as_not_a_conflict(tmp_path, ruleset):
+    """目标名就是源自己、只差大小写 -> 不是冲突，是纯大小写改名。
+
+    统一大写之后，每个小写厂牌的目录都会走到这一步：``avop-235-C``
+    的规范名是 ``AVOP-235-C``。这个名字在磁盘上被**源自己**占着 ——
+    它不是「被别人占了」，所以不能判成冲突，否则大写化永远推不动。
+
+    真正的撞名是「旁边还站着另一个条目」，那种情况由
+    :func:`test_build_plan_treats_case_variant_target_as_conflict` 守着。
+
+    执行层的两步改名（先挪临时名再改目标名）在
+    ``tests/test_fscompat.py::test_apply_plan_case_only_rename_does_not_add_counter``
+    里有覆盖。
+    """
+    plan = engine.build_plan(tmp_path, ruleset, names=["avop-235-C"])
+
+    assert plan.items[0].action is Action.RENAME
+    assert plan.items[0].target == "AVOP-235-C"
+
+
+def test_build_plan_rejects_case_variant_when_another_entry_exists(tmp_path, ruleset):
+    """源自己和另一个条目占着同一个名字 -> 真冲突。
+
+    大小写敏感的卷上 ``avop-235-C`` 与 ``AVOP-235-C`` 能同时存在；
+    整理到 exFAT 上它们会撞在一起。源自己占位不算冲突，
+    但「旁边还有另一个」就算。
+    """
+    plan = engine.build_plan(
+        tmp_path, ruleset, names=["avop-235-C"], existing=["avop-235-C", "AVOP-235-C"]
+    )
+
+    assert plan.items[0].action is Action.CONFLICT
 
 
 def test_build_plan_batch_duplicate_ignores_case(tmp_path, ruleset):
@@ -157,13 +191,13 @@ def test_merge_keeps_case_variant_file(tmp_path, ruleset):
 
     merged = [r for r in results if r["action"] == "merge"]
     assert len(merged) == 1
-    assert merged[0]["skipped"] == ["a.mp4"]
-    # 主目录里没被塞进一个只差大小写的副本，原文件也没被动。
+    # 副本那份没被覆盖 —— 它改名进了主目录（``A (2).mp4``）
+    assert (tmp_path / "SDMM028C" / "A.mp4").read_bytes() == b"primary"
+    assert (tmp_path / "SDMM028C" / "A (2).mp4").read_bytes() == b"copy"
+    # 主目录里没被塞进一个只差大小写的副本（``a.mp4``），原文件也没被动。
     # 不能用 exists() 判断 —— 大小写不敏感的卷上 primary/"a.mp4"
     # 会解析到 A.mp4，恒为真。要看目录里**实际存的名字**。
-    assert sorted(p.name for p in primary.iterdir()) == ["A.mp4"]
-    assert (primary / "A.mp4").read_bytes() == b"primary"
-    assert (duplicate / "a.mp4").read_bytes() == b"copy"
+    assert sorted(p.name for p in primary.iterdir()) == ["A (2).mp4", "A.mp4"]
 
 
 # --------------------------------------------------------------------------
@@ -185,20 +219,25 @@ def test_isolate_conflict_ignores_case(tmp_path, ruleset):
 
 
 # --------------------------------------------------------------------------
-# rename_files：目标名只差大小写 -> 冲突，不是「可以改名」
+# rename_files：目标名只差大小写 -> 两份都留着，不覆盖
 # --------------------------------------------------------------------------
 
 
-def test_rename_files_case_variant_target_is_conflict(tmp_path, ruleset):
-    """目录里已有 ``club-810.mp4``，``CLUB810.mp4`` 的目标名撞名 -> 冲突。"""
+def test_rename_files_case_variant_target_keeps_both(tmp_path, ruleset):
+    """目录里已有 ``club-810.mp4``，``CLUB810.mp4`` 的目标名撞名。
+
+    撞名不是「冲突放弃」—— 按体积分配：大的占规范名，小的加序号。
+    关键仍然是**绝不覆盖**。
+    """
     (tmp_path / "CLUB-810").mkdir()
     (tmp_path / "CLUB-810" / "CLUB810.mp4").write_bytes(b"new")
-    (tmp_path / "CLUB-810" / "club-810.mp4").write_bytes(b"original")
+    (tmp_path / "CLUB-810" / "club-810.mp4").write_bytes(b"original payload")
 
     plan = rf.build_file_plan(tmp_path, ruleset)
 
     item = next(i for i in plan.items if i.original == "CLUB810.mp4")
-    assert item.action is rf.FileAction.CONFLICT
+    assert item.action is rf.FileAction.RENAME
+    assert item.target == "CLUB-810 (2).mp4"
 
 
 # --------------------------------------------------------------------------

@@ -316,15 +316,20 @@ def merge(
     root: str = typer.Argument(..., help="要整理的父目录"),
     apply: bool = typer.Option(False, "--apply", help="真正执行合并（默认只预览）"),
     rules: Optional[Path] = typer.Option(None, "--rules", help="规则文件路径"),
-    include_partial: bool = typer.Option(
-        False, "--include-partial", help="同时处理部分重叠的组（只并入不冲突的文件）"
+    keep_separate: bool = typer.Option(
+        False, "--keep-separate",
+        help="保守模式：只合并内容完全一致的组，内容不同/部分重叠的各自保留",
     ),
     json_out: bool = typer.Option(False, "--json", help="以 JSON 输出计划"),
 ) -> None:
     """识别重复目录并合并。
 
+    默认**一律合并**基础名相同的目录：保留一个主目录，其余目录的文件
+    挪进去。文件级撞名按**体积**分配 —— 大的那份占着规范名，小的改名
+    `` (2)``，两份都留着；内容完全相同的只留一份。
+
     判定依据是**文件内容指纹**，不是目录名 —— 带 (1) 的目录未必是复制副本，
-    也可能是同作品的不同画质版本或分P。内容不同的目录一律保留，绝不合并。
+    也可能是同作品的不同画质版本或分P。
     """
     root_dir = _resolve_root(root)
     ruleset = _load_rules(rules)
@@ -344,20 +349,29 @@ def merge(
         if not json_out:
             counts = plan.summary()
             typer.secho(
-                f"\n预览模式：{counts['duplicate']} 组内容完全一致（可合并）、"
-                f"{counts['partial']} 组部分重叠、{counts['different']} 组内容不同（不合并）。"
+                f"\n预览模式：{counts['groups']} 组基础名相同 —— "
+                f"{counts['duplicate']} 组内容完全一致、"
+                f"{counts['partial']} 组部分重叠、"
+                f"{counts['different']} 组内容不同。"
                 f" 确认无误后加 --apply 执行。",
                 fg=typer.colors.YELLOW,
             )
+            if keep_separate:
+                typer.secho(
+                    "保守模式：只有内容完全一致的组会被合并，"
+                    "内容不同/部分重叠的组各自保留。",
+                    fg=typer.colors.YELLOW,
+                )
         return
 
     results = merge_mod.apply_merge_plan(
-        root_dir, plan, only_duplicates=not include_partial
+        root_dir, plan, only_duplicates=keep_separate
     )
     merged = [r for r in results if r["action"] == MergeAction.MERGE.value]
     kept = [r for r in results if r["action"] == MergeAction.KEEP.value]
     skipped = [r for r in results if r["action"] == MergeAction.SKIP.value]
     failed_total = sum(len(r.get("failed", [])) for r in results)
+    deduped_total = sum(len(r.get("deduped", [])) for r in results)
     typer.secho(
         f"合并完成：{len(merged)} 个副本目录已并入，"
         f"{len(kept)} 个主目录保留，{len(skipped)} 个未处理。",
@@ -365,9 +379,10 @@ def merge(
     )
     for r in merged:
         typer.echo(f"  {r['dir']}  ->  {r['base']}  (并入 {len(r['moved'])} 个文件)")
-        if r["skipped"]:
+        if r.get("deduped"):
             typer.secho(
-                f"      冲突保留 {len(r['skipped'])} 个同名不同内容文件", fg=typer.colors.YELLOW
+                f"      内容重复已去重 {len(r['deduped'])} 个（只留一份）",
+                fg=typer.colors.YELLOW,
             )
         if r.get("failed"):
             typer.secho(
@@ -375,6 +390,11 @@ def merge(
                 f"{', '.join(r['failed'][:3])}",
                 fg=typer.colors.RED,
             )
+    if deduped_total:
+        typer.secho(
+            f"共去重 {deduped_total} 个内容完全相同的文件（每个只留一份）。",
+            fg=typer.colors.YELLOW,
+        )
     if failed_total:
         typer.secho(
             f"共 {failed_total} 个文件未能并入 —— 通常是被其他程序占用"
@@ -536,8 +556,9 @@ def tidy(
     root: str = typer.Argument(..., help="要整理的目录"),
     apply: bool = typer.Option(False, "--apply", help="真正执行（默认只预览）"),
     rules: Optional[Path] = typer.Option(None, "--rules", help="规则文件路径"),
-    include_partial: bool = typer.Option(
-        False, "--include-partial", help="同时处理部分重叠的组"
+    keep_separate: bool = typer.Option(
+        False, "--keep-separate",
+        help="保守模式：内容不同/部分重叠的同名目录各自保留，不合并",
     ),
     isolate: Optional[str] = typer.Option(
         None, "--isolate", help="把不符合番号规范的目录挪到这里（如 D:\\Media\\GC）"
@@ -594,7 +615,7 @@ def tidy(
 
     result = tidy_mod.apply_tidy_plan(
         root_dir, ruleset, plan,
-        include_partial=include_partial,
+        keep_separate=keep_separate,
         clean_forks=not keep_forks,
         isolate_to=isolate_to,
     )

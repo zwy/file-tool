@@ -90,13 +90,24 @@ def test_different_code_keeps_its_own_code(tmp_path, ruleset):
 
 
 def test_different_code_conflict_is_never_overwritten(tmp_path, ruleset):
-    """别的番号的文件剥掉水印后撞上已有文件 -> 报冲突，绝不覆盖。"""
-    make(tmp_path, "STSK-108/aavv38.xyz@STSK108A.mp4")
-    make(tmp_path, "STSK-108/STSK-108A.mp4")
+    """别的番号的文件剥掉水印后撞上已有文件 -> 按体积分配，绝不覆盖。
+
+    撞名的两份**都留着**：占着规范名的是大的那份，小的那份加序号。
+    """
+    make(tmp_path, "STSK-108/aavv38.xyz@STSK108A.mp4", "small")
+    make(tmp_path, "STSK-108/STSK-108A.mp4", "a much bigger payload")
     plan = plan_for(tmp_path, ruleset)
     item = find(plan, "STSK-108/aavv38.xyz@STSK108A.mp4")
-    assert item.action is rf.FileAction.CONFLICT
-    assert item.target == "STSK-108A.mp4"
+    assert item.action is rf.FileAction.RENAME
+    assert item.target == "STSK-108A (2).mp4"
+
+    result = rf.apply_file_plan(tmp_path, plan)
+    assert not result["failed"]
+    kept = {p.name: p.read_text() for p in (tmp_path / "STSK-108").iterdir()}
+    assert kept == {
+        "STSK-108A.mp4": "a much bigger payload",
+        "STSK-108A (2).mp4": "small",
+    }
 
 
 def test_file_without_code_is_left_alone(tmp_path, ruleset):
@@ -178,33 +189,47 @@ def test_resource_fork_is_skipped(tmp_path, ruleset):
 # --------------------------------------------------------------------------
 
 
-def test_existing_target_is_conflict(tmp_path, ruleset):
-    """目标已存在 -> 冲突，绝不覆盖。"""
-    make(tmp_path, "CLUB-810/CLUB810.mp4")
-    make(tmp_path, "CLUB-810/CLUB-810.mp4")
+def test_existing_target_gets_numbered_name(tmp_path, ruleset):
+    """目标已存在 -> 不覆盖：大的占规范名，小的加序号。"""
+    make(tmp_path, "CLUB-810/CLUB810.mp4", "small")
+    make(tmp_path, "CLUB-810/CLUB-810.mp4", "a much bigger payload")
     plan = plan_for(tmp_path, ruleset)
     item = find(plan, "CLUB-810/CLUB810.mp4")
-    assert item.action is rf.FileAction.CONFLICT
-    assert item.target == "CLUB-810.mp4"
+    assert item.action is rf.FileAction.RENAME
+    assert item.target == "CLUB-810 (2).mp4"
 
 
 def test_case_only_difference_is_not_a_conflict(tmp_path, ruleset):
     """仅大小写不同 -> 不是冲突，是纯大小写改名。
 
-    实测 G 盘踩到的坑：目录名是 ``club-880``（小写），文件名是
-    ``CLUB-880.mp4``（大写）。目录名规范化后目标名是 ``club-880.mp4``，
+    实测 G 盘踩到的坑：目录名是 ``CLUB-880``，文件名是
+    ``club-880.mp4``。规范化后的目标名是 ``CLUB-880.mp4``，
     而在 exFAT / APFS（默认）这种大小写不敏感的卷上，
     ``Path.exists()`` 判定「已存在」恒为真 —— 明明是同一个文件，
     却被判成冲突，文件名就永远规范化不了。
 
     正确判定靠文件身份（inode + 设备号），不是路径字符串。
     """
+    make(tmp_path, "CLUB-880/club-880.mp4")
+    plan = plan_for(tmp_path, ruleset)
+    item = find(plan, "CLUB-880/club-880.mp4")
+    assert item is not None
+    assert item.action is rf.FileAction.RENAME, "仅大小写不同不该判成冲突"
+    assert item.target == "CLUB-880.mp4"
+
+
+def test_file_matching_canonical_name_is_kept(tmp_path, ruleset):
+    """目录改成大写后文件已经对上 -> 不用动。
+
+    统一大写之后，「目录是小写、文件是大写」这种组合不再需要改文件名 ——
+    目录自己会变成大写，文件名已经是对的。
+    """
     make(tmp_path, "club-880/CLUB-880.mp4")
     plan = plan_for(tmp_path, ruleset)
     item = find(plan, "club-880/CLUB-880.mp4")
     assert item is not None
-    assert item.action is rf.FileAction.RENAME, "仅大小写不同不该判成冲突"
-    assert item.target == "club-880.mp4"
+    assert item.action is rf.FileAction.KEEP
+    assert item.target == "CLUB-880.mp4"
 
 
 def test_case_only_rename_actually_applies(tmp_path, ruleset):
@@ -214,23 +239,61 @@ def test_case_only_rename_actually_applies(tmp_path, ruleset):
     ``Path.exists()`` 对 ``CLUB-880.mp4`` 和 ``club-880.mp4`` 都返回 True ——
     那是同一个文件。所以只能看**目录列表里实际存的名字**。
     """
-    make(tmp_path, "club-880/CLUB-880.mp4", "payload")
+    make(tmp_path, "CLUB-880/club-880.mp4", "payload")
     plan = plan_for(tmp_path, ruleset)
     result = rf.apply_file_plan(tmp_path, plan)
     assert len(result["renamed"]) == 1
 
-    names = sorted(p.name for p in (tmp_path / "club-880").iterdir())
-    assert names == ["club-880.mp4"], f"实际文件名 {names}"
-    assert (tmp_path / "club-880" / "club-880.mp4").read_text() == "payload"
+    names = sorted(p.name for p in (tmp_path / "CLUB-880").iterdir())
+    assert names == ["CLUB-880.mp4"], f"实际文件名 {names}"
+    assert (tmp_path / "CLUB-880" / "CLUB-880.mp4").read_text() == "payload"
 
 
-def test_real_conflict_with_different_case_is_still_conflict(tmp_path, ruleset):
-    """真的是两个文件（哪怕只差大小写）-> 仍然是冲突，绝不覆盖。"""
+def test_real_conflict_with_different_case_keeps_both(tmp_path, ruleset):
+    """真的是两个文件（哪怕只差大小写）-> 两份都留着，绝不覆盖。"""
     make(tmp_path, "CLUB-810/CLUB810.mp4", "new")
-    make(tmp_path, "CLUB-810/club-810.mp4", "original")
+    make(tmp_path, "CLUB-810/club-810.mp4", "original payload")
     plan = plan_for(tmp_path, ruleset)
-    item = find(plan, "CLUB-810/CLUB810.mp4")
-    assert item.action is rf.FileAction.CONFLICT
+    result = rf.apply_file_plan(tmp_path, plan)
+    assert not result["conflicts"]
+
+    kept = {p.name: p.read_text() for p in (tmp_path / "CLUB-810").iterdir()}
+    assert kept == {
+        "CLUB-810.mp4": "original payload",
+        "CLUB-810 (2).mp4": "new",
+    }
+
+
+def test_bigger_file_takes_the_canonical_name(tmp_path, ruleset):
+    """实测场景：两个压制版本撞名 -> 大的占规范名，小的让位。
+
+    ``CLUB-806/`` 里 ``CLUB-806C.mp4``（1.19 GB）和 ``CLUB806C.mp4``
+    （2.23 GB）规范化后指向同一个名字。大的那份占着规范名，
+    小的那份改名 `` (2)`` —— 两份都留着。
+
+    执行顺序有讲究：占着规范名的那份要等让位的那份先挪走，
+    否则改名会撞上。
+    """
+    make(tmp_path, "CLUB-806/CLUB-806C.mp4", "small")
+    make(tmp_path, "CLUB-806/CLUB806C.mp4", "a much bigger payload")
+
+    plan = plan_for(tmp_path, ruleset)
+    bigger = find(plan, "CLUB-806/CLUB806C.mp4")
+    smaller = find(plan, "CLUB-806/CLUB-806C.mp4")
+    assert bigger.target == "CLUB-806C.mp4", "大的那份该占规范名"
+    assert smaller.target == "CLUB-806C (2).mp4", "小的那份该让位"
+    assert bigger.action is rf.FileAction.RENAME
+    assert smaller.action is rf.FileAction.RENAME
+
+    result = rf.apply_file_plan(tmp_path, plan)
+    assert not result["conflicts"]
+    assert not result["failed"]
+
+    kept = {p.name: p.read_text() for p in (tmp_path / "CLUB-806").iterdir()}
+    assert kept == {
+        "CLUB-806C.mp4": "a much bigger payload",
+        "CLUB-806C (2).mp4": "small",
+    }
 
 
 # --------------------------------------------------------------------------
@@ -248,14 +311,18 @@ def test_apply_renames_file(tmp_path, ruleset):
 
 
 def test_apply_never_overwrites(tmp_path, ruleset):
-    """冲突时原文件保持不动，目标文件内容不被改写。"""
+    """撞名时两份文件的内容都不被改写 —— 大的占规范名，小的加序号。"""
     make(tmp_path, "CLUB-810/CLUB810.mp4", "new")
-    make(tmp_path, "CLUB-810/CLUB-810.mp4", "original")
+    make(tmp_path, "CLUB-810/CLUB-810.mp4", "original payload")
     plan = plan_for(tmp_path, ruleset)
     result = rf.apply_file_plan(tmp_path, plan)
-    assert len(result["conflicts"]) == 1
-    assert (tmp_path / "CLUB-810" / "CLUB810.mp4").read_text() == "new"
-    assert (tmp_path / "CLUB-810" / "CLUB-810.mp4").read_text() == "original"
+    assert not result["conflicts"]
+
+    kept = {p.name: p.read_text() for p in (tmp_path / "CLUB-810").iterdir()}
+    assert kept == {
+        "CLUB-810.mp4": "original payload",
+        "CLUB-810 (2).mp4": "new",
+    }
 
 
 def test_apply_leaves_untouched_files(tmp_path, ruleset):
