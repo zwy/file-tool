@@ -233,19 +233,19 @@ def detect_video(
 
     if not best_id or best_result.prefix_len < fingerprint.MIN_PREFIX_FRAMES:
         static_ratio = _static_ratio(signature.mad)
-        # 人工核验过的边界是最终裁决 —— 就算模板没匹配上（模板库还没学到
-        # 这支广告），只要人眼量过「站方广告到此为止」，照样该裁。
-        if manual is not None:
-            return Detection(
-                path=label, duration=info.duration, size=info.size,
-                verdict=Verdict.CUT,
-                cut_at=round(manual.cut_at, 3),
-                confidence=1.0,
-                static_ratio=round(static_ratio, 3),
-                reason=(
-                    f"片头没匹配到已知模板，但采用人工核验边界 {manual.cut_at:.0f}s"
-                ),
-            )
+        # 这里**不**按人工边界裁。
+        #
+        # 人工边界记的是「原始文件里站方广告到哪为止」，
+        # 只有在片头**还认得出这支广告**时才适用。
+        # 要是连模板都匹配不上（广告已经不在片头了 —— 比如这支已经裁过了），
+        # 还照着边界再裁一次，就是**把正片又砍掉一截**。
+        #
+        # 实测踩过：全量裁剪之后重跑一次，3 支被裁了两遍
+        # （SVDVD-739 多砍 290 秒、DVMM-012 多砍 318 秒、STSK-108A 多砍 208 秒）。
+        # 根因就是这条「模板失配也按人工边界裁」的兜底规则。
+        #
+        # 边界表里的 71 支全都靠模板匹配识别（最小 prefix = 5 帧），
+        # 所以去掉这条兜底不影响任何一支的判定 —— 只是让工具变得幂等。
         note = ""
         if static_ratio >= 0.6:
             note = (

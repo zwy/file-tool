@@ -139,8 +139,16 @@ class TestDetectOverride:
         result = detect.detect_video(path, bank, root=tmp_path, head_seconds=40.0)
         assert result.cut_at == 30
 
-    def test_manual_boundary_survives_unmatched_template(self, tmp_path: Path):
-        """模板没匹配上，但人眼量过边界 —— 照样该裁。"""
+    def test_manual_boundary_does_not_cut_when_template_unmatched(self, tmp_path: Path):
+        """模板没匹配上 —— **不**按人工边界裁。
+
+        人工边界记的是「原始文件里站方广告到哪为止」。
+        片头已经认不出这支广告，很可能这支已经裁过了 ——
+        这时再照边界裁一刀，就是把正片又砍掉一截。
+
+        实测踩过这个坑：全量裁剪后重跑一次，3 支被裁了两遍
+        （SVDVD-739 多砍 290 秒、DVMM-012 多砍 318 秒、STSK-108A 多砍 208 秒）。
+        """
         from file_tool.adcut import detect
 
         path = self._fake_video(tmp_path)
@@ -153,8 +161,62 @@ class TestDetectOverride:
         result = detect.detect_video(
             path, bank, root=tmp_path, head_seconds=40.0, boundaries=manual,
         )
-        assert result.verdict is Verdict.CUT
-        assert result.cut_at == 18
+        assert result.verdict is not Verdict.CUT
+        assert result.cut_at == 0
+
+    def _ad_then_content_video(self, tmp_path: Path) -> Path:
+        """造一段「前 5 秒是广告，后面 10 秒是正片」的视频。
+
+        两段画面必须不一样（测试图 vs 彩条），裁掉广告之后片头就换了内容 ——
+        这样才能验证「裁完再扫，不会又判成可裁」。
+        """
+        import shutil
+        import subprocess
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            pytest.skip("没有 ffmpeg")
+        path = tmp_path / "clip.mp4"
+        subprocess.run(
+            [ffmpeg, "-v", "error", "-y",
+             "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=10:duration=5",
+             "-f", "lavfi", "-i", "smptebars=size=64x64:rate=10:duration=10",
+             "-filter_complex", "[0:v][1:v]concat=n=2:v=1:a=0[v]",
+             "-map", "[v]", "-pix_fmt", "yuv420p", str(path)],
+            check=True, capture_output=True,
+        )
+        return path
+
+    def test_cut_is_idempotent(self, tmp_path: Path):
+        """裁完之后再扫一遍 —— 不能再判成「该裁」。
+
+        这是「重跑一次不会把片子再砍一遍」的保证。
+        """
+        from file_tool.adcut import cut as cut_mod
+        from file_tool.adcut import detect, fingerprint
+
+        path = self._ad_then_content_video(tmp_path)
+        # 广告模板 = 原片前 5 秒的指纹
+        ad_sig = fingerprint.signature_of(path, 5.0, fps=1.0)
+        bank = TemplateBank(templates=[AdTemplate(
+            id="tpl-0001", label="广告",
+            hashes=list(ad_sig.hashes), brightness=list(ad_sig.brightness), fps=1.0,
+            sample="clip.mp4", status=TemplateStatus.CONFIRMED,
+        )])
+        manual = {"clip.mp4": AdBoundary(path="clip.mp4", cut_at=5, note="人工核验")}
+
+        first = detect.detect_video(
+            path, bank, root=tmp_path, head_seconds=40.0, boundaries=manual)
+        assert first.verdict is Verdict.CUT
+        assert first.cut_at == 5
+
+        # 真的裁掉
+        outcome = cut_mod.cut_video(path, cut_at=first.cut_at)
+        assert outcome.ok, outcome.reason
+
+        # 再扫一遍：广告已经不在片头了，不该再判成可裁
+        second = detect.detect_video(
+            path, bank, root=tmp_path, head_seconds=40.0, boundaries=manual)
+        assert second.verdict is not Verdict.CUT
 
 
 class TestSuffixMatch:

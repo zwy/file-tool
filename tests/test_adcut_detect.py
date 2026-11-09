@@ -88,6 +88,30 @@ def make_sparse_keyframe_video(path: Path, seconds: int = 20) -> Path:
     return path
 
 
+def corrupt_one_packet(path: Path, skip_first: int = 0) -> float:
+    """把某个视频包的长度前缀写成 0 —— 人为制造一个损坏的访问单元。
+
+    mp4 里的 H.264 是长度前缀格式：每个访问单元前面 4 个字节是它自己的
+    长度。写成 0 之后，h264 解析器读到就会报 ``Invalid NAL unit size``，
+    ``concat`` 解复用器读到那里会直接停止 —— 正是素材库里那几支坏包的成因。
+
+    返回被破坏那个包的时间点（秒）。
+    """
+    import json
+
+    proc = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "packet=pts_time,pos,size", "-of", "json", str(path)],
+        capture_output=True, text=True, check=True, timeout=120,
+    )
+    packets = json.loads(proc.stdout)["packets"]
+    victim = packets[skip_first + 1]
+    with open(path, "r+b") as fh:
+        fh.seek(int(victim["pos"]))
+        fh.write(b"\x00\x00\x00\x00")
+    return float(victim["pts_time"])
+
+
 @pytest.fixture()
 def ad_bank(tmp_path: Path) -> TemplateBank:
     """一个模板库里有一条学好的广告模板。"""
@@ -367,6 +391,86 @@ class TestCut:
         outcome = cut_mod.cut_video(tmp_path / "nope.mp4", cut_at=5.0)
         assert not outcome.ok
         assert "不存在" in outcome.reason
+
+
+class TestProbeDetails:
+    """``probe()`` 里几个容易踩坑的细节。"""
+
+    def test_fps_comes_from_video_track(self, tmp_path: Path):
+        """帧率必须取视频轨的。
+
+        音频轨的 ``r_frame_rate`` 是 ``0/0``。以前按行解析，
+        音频轨那行会把帧率冲成 0 —— 坏包自愈靠帧率换算断点位置，
+        帧率是 0 就定位不到断点了。
+        """
+        cmd = [
+            ffmpeg.require_executable("ffmpeg"), "-v", "error", "-y",
+            "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=25:duration=6",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=6",
+            "-map", "0:v", "-map", "1:a",
+            "-pix_fmt", "yuv420p", str(tmp_path / "av.mp4"),
+        ]
+        subprocess.run(cmd, capture_output=True, check=True, timeout=120)
+        info = ffmpeg.probe(tmp_path / "av.mp4")
+        assert info.has_video and info.has_audio
+        assert info.fps == pytest.approx(25.0, abs=0.01)
+
+    def test_video_frame_count(self, tmp_path: Path):
+        video = make_video(tmp_path / "a.mp4", ad_seconds=2, content_seconds=3)
+        count = ffmpeg.video_frame_count(video)
+        assert count > 0
+
+    def test_keyframes_between_finds_middle_of_file(self, tmp_path: Path):
+        """指定区间的关键帧探测要能落到片子中段。"""
+        video = make_sparse_keyframe_video(tmp_path / "a.mp4")
+        found = ffmpeg.keyframes_between(video, 4.0, 8.0)
+        assert any(4.0 <= k <= 12.0 for k in found)
+
+    def test_corrupt_points_finds_zero_length_prefix(self, tmp_path: Path):
+        """人为把某个包的长度前缀写成 0 —— 扫描要能把它找出来。"""
+        video = make_sparse_keyframe_video(tmp_path / "a.mp4")
+        target = corrupt_one_packet(video, skip_first=3)
+        points = ffmpeg.corrupt_points(video)
+        assert len(points) == 1
+        assert abs(points[0] - target) < 0.5
+
+
+class TestCorruptPacketRecovery:
+    """源文件带坏包时，混合裁剪要能绕过去。
+
+    有些源文件自带损坏的 H.264 访问单元。单个 mp4 拷贝遇到它只是打个
+    警告，但 ``concat`` 解复用器读到那里就**停止读** —— 而且 ffmpeg 的
+    退出码还是 0，产物于是被静默截断（少掉一整段片子尾巴）。
+
+    所以混合裁剪拼完必须核对长度，短了就绕开坏包重拼。
+    """
+
+    def test_cut_survives_a_corrupt_packet(self, tmp_path: Path):
+        video = make_sparse_keyframe_video(tmp_path / "a.mp4")
+        before = ffmpeg.probe(video).duration
+        # 坏包要落在**正文**里（裁剪点之后），才会触发拼接截断
+        corrupt_one_packet(video, skip_first=120)
+        outcome = cut_mod.cut_video(video, cut_at=7.0)
+        assert outcome.ok, outcome.reason
+        after = ffmpeg.probe(video).duration
+        assert before - after == pytest.approx(7.0, abs=1.0)
+
+    def test_cut_is_refused_without_losing_content_when_recovery_fails(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """绕不过去的时候要报错，而且**原片不能动**。"""
+        video = make_sparse_keyframe_video(tmp_path / "a.mp4")
+        size_before = video.stat().st_size
+        corrupt_one_packet(video, skip_first=120)
+        monkeypatch.setattr(
+            cut_mod.ffmpeg, "corrupt_points", lambda *a, **k: []
+        )
+        monkeypatch.setattr(
+            cut_mod.ffmpeg, "video_frame_count", lambda *a, **k: 0
+        )
+        outcome = cut_mod.cut_video(video, cut_at=7.0)
+        assert not outcome.ok
+        assert video.stat().st_size == size_before
 
 
 class TestCluster:

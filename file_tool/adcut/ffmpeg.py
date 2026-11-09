@@ -18,6 +18,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -188,17 +189,20 @@ def probe(path: Path, timeout: int = 60) -> MediaInfo:
         elif line.startswith("size="):
             size = int(_safe_float(line.split("=", 1)[1]))
         elif line.startswith("codec_type="):
+            # 每条流都会重复一遍字段，靠 codec_type 切段 ——
+            # 音频轨的 r_frame_rate 是 0/0，混进来会把帧率冲成 0
             codec_type = line.split("=", 1)[1]
-            if codec_type == "video":
-                has_video = True
-            elif codec_type == "audio":
-                has_audio = True
+            has_video = has_video or codec_type == "video"
+            has_audio = has_audio or codec_type == "audio"
+            current = codec_type
         elif line.startswith("width="):
             width = int(_safe_float(line.split("=", 1)[1]))
         elif line.startswith("height="):
             height = int(_safe_float(line.split("=", 1)[1]))
         elif line.startswith("r_frame_rate="):
-            fps = _safe_rate(line.split("=", 1)[1])
+            value = _safe_rate(line.split("=", 1)[1])
+            if value:
+                fps = value
 
     vcodec, acodec = _probe_codecs(path)
     return MediaInfo(
@@ -341,6 +345,135 @@ def keyframes(path: Path, seconds: float, timeout: int = DEFAULT_TIMEOUT) -> Lis
         if value >= 0:
             out.append(value)
     return sorted(out)
+
+
+def corrupt_points(path: Path, timeout: int = 900) -> List[float]:
+    """找出视频流里**损坏的访问单元**所在的时间点（秒）。
+
+    有些源文件自带损坏的 H.264 访问单元。单个 mp4 拷贝遇到它只是打个
+    警告照常写完，但 ``concat`` 解复用器读到那里就**停止读** ——
+    而且 ffmpeg 的退出码还是 0，产物于是被静默截断。
+
+    一个文件可能有好几处坏包（实测 DVDMS-813 有三处），
+    所以要一次全找出来，而不是发现一个补一个。
+
+    ## 怎么找
+
+    mp4 里的 H.264 是「长度前缀」格式：每个访问单元前面 4 个字节是它
+    自己的长度。坏掉的那些单元，长度字段被写成了 0 ——
+    解析器读到就会报 ``Invalid NAL unit size (0 > N)``。
+
+    所以只要拿到每个包在文件里的偏移（``ffprobe`` 的 ``packet.pos``），
+    读一下头 4 字节就能定位，不用解码整个视频。
+
+    > 走过弯路：本来是让 ffmpeg 解析器跑一遍、从进度行里读时间。
+    > 但进度行是按**墙钟**间隔打印的，扫描跑 3000 倍速时，
+    > 相邻两行能差三千多秒 —— 定位精度完全不够。
+    """
+    exe = require_executable("ffprobe")
+    cmd = [
+        exe, "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "packet=pts_time,pos,size",
+        "-of", "json",
+        str(path),
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return []
+    if proc.returncode != 0:
+        return []
+    try:
+        packets = json.loads(proc.stdout.decode("utf-8", "replace")).get("packets", [])
+    except ValueError:
+        return []
+
+    points: List[float] = []
+    fd = os.open(str(path), os.O_RDONLY)
+    try:
+        for packet in packets:
+            try:
+                pos = int(packet["pos"])
+                size = int(packet["size"])
+                pts = float(packet["pts_time"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if size < 4:
+                continue
+            try:
+                head = os.pread(fd, 4, pos)
+            except OSError:
+                continue
+            if head == b"\x00\x00\x00\x00":
+                points.append(pts)
+    finally:
+        os.close(fd)
+    return points
+
+
+def keyframes_between(
+    path: Path,
+    start: float,
+    duration: float,
+    timeout: int = DEFAULT_TIMEOUT,
+) -> List[float]:
+    """列出**指定区间**内的关键帧时间戳（秒）。
+
+    ``keyframes()`` 只能扫片头（``%+N``）。修复「拼接被坏包打断」时
+    要在片子中段找切点，所以这里要能定位到任意区间。
+    """
+    exe = require_executable("ffprobe")
+    cmd = [
+        exe, "-v", "error",
+        "-read_intervals", f"{start:.3f}%+{duration:.3f}",
+        "-select_streams", "v:0",
+        "-skip_frame", "nokey",
+        "-show_entries", "frame=pts_time",
+        "-of", "csv=p=0",
+        str(path),
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise FFmpegError(f"关键帧探测超时：{path}") from exc
+    if proc.returncode != 0:
+        return []
+    out: List[float] = []
+    for line in proc.stdout.decode("utf-8", "replace").splitlines():
+        text = line.strip().strip(",")
+        if not text or text == "N/A":
+            continue
+        value = _safe_float(text)
+        if value >= 0:
+            out.append(value)
+    return sorted(out)
+
+
+def video_frame_count(path: Path, timeout: int = DEFAULT_TIMEOUT) -> int:
+    """视频轨的帧数（读 mp4 的采样表，不用解码）。
+
+    用来判断「拼接产物比该有的短了多少帧」——
+    短的那个差值正好指向被坏包打断的位置。
+    """
+    exe = require_executable("ffprobe")
+    cmd = [
+        exe, "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=nb_frames",
+        "-of", "csv=p=0",
+        str(path),
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise FFmpegError(f"帧数探测超时：{path}") from exc
+    if proc.returncode != 0:
+        return 0
+    text = proc.stdout.decode("utf-8", "replace").strip().splitlines()
+    if not text:
+        return 0
+    return int(_safe_float(text[0].strip().strip(",")))
 
 
 def extract_segment_frames(

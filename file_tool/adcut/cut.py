@@ -167,6 +167,8 @@ def _hybrid_cut(
     keyframes: List[float],
     copy_args: List[str],
     reencode_args: List[str],
+    expected: float = 0.0,
+    fps: float = 0.0,
     timeout: int = 7200,
 ) -> None:
     """精确切在 ``cut_at``：只重编码开头一小段，正文流拷贝，再拼起来。
@@ -181,6 +183,16 @@ def _hybrid_cut(
     成片时长误差 0.03 秒，而耗时从「半小时」降到「几秒」。
 
     中间文件的文件名里带 ``.adcut-tmp``，扫描器会躲开它们。
+
+    ## 坏包自愈
+
+    有些源文件本身带**损坏的 H.264 访问单元**（HODV-21651 就有两处）。
+    单个 mp4 拷贝遇到它只是打个警告照常写完，但 ``concat`` 解复用器
+    会在那里**直接报错并停止读**——而且 ffmpeg 的退出码还是 0，
+    于是产物被静默截断（少了 899 秒）。
+
+    所以拼完必须核对长度，短了就在**断点附近**把那一小段重新编码，
+    绕开坏包再拼一次。重编码的只有十几秒，其余照旧无损拷贝。
     """
     exe = ffmpeg.require_executable("ffmpeg")
     after = [k for k in keyframes if k >= cut_at + 0.05]
@@ -202,37 +214,205 @@ def _hybrid_cut(
             tail = "\n".join(err.splitlines()[-6:])
             raise CutError(f"{what}失败：{source}\n{tail}")
 
-    try:
-        # 1) 开头一小段重编码
+    def encode_head(
+        src_start: float,
+        src_end: float,
+        out_path: Path,
+        anchor: Optional[float] = None,
+    ) -> None:
+        """重编码 ``[src_start, src_end]``。
+
+        **为什么是两次定位**：裁剪点几乎总是落在 GOP 中间（关键帧间隔 8.34 秒）。
+        直接 `-ss 裁剪点 -i 源文件`，精确 seek 会停在那个位置，
+        解码器拿到的第一帧不是 IDR —— 解不出来，
+        头几帧就成了坏帧（"Invalid NAL unit size"），
+        后面 concat 时直接报错，或者拼出一个短了几百秒的残片。
+
+        所以：**输入定位到上一个关键帧**（那里能正常解），
+        **输出再定位回精确的裁剪点**（丢掉前面那几帧）。
+        代价只是多解一个 GOP 的画面，收益是首帧一定是对的。
+
+        ``anchor`` 就是那个「上一个关键帧」；不给就现查。
+        """
+        if anchor is None:
+            inner = [k for k in keyframes if k < src_start - 0.05]
+            anchor = inner[-1] if inner else None
+        if anchor is not None and 0 < src_start - anchor < 600:
+            head_in = ["-ss", f"{anchor:.3f}"]
+            head_out = ["-ss", f"{src_start - anchor:.3f}"]
+        else:
+            head_in = ["-ss", f"{src_start:.3f}"]
+            head_out = []
         run(
             [exe, "-v", "error", "-y",
-             "-ss", f"{cut_at:.3f}", "-i", str(source),
-             "-t", f"{head_end - cut_at:.3f}",
+             *head_in, "-i", str(source),
+             *head_out,
+             "-t", f"{src_end - src_start:.3f}",
              "-map", "0:v", "-map", "0:a?", "-map", "0:s?", *reencode_args,
-             str(head)],
+             str(out_path)],
             "混合裁剪：重编码开头段",
         )
-        # 2) 正文流拷贝
-        run(
-            [exe, "-v", "error", "-y",
-             "-ss", f"{head_end:.3f}", "-i", str(source),
-             "-map", "0", "-dn", *copy_args,
-             str(body)],
-            "混合裁剪：流拷贝正文",
-        )
-        # 3) 拼起来
+
+    def copy_body(src_start: float, src_end: Optional[float], out_path: Path) -> None:
+        """流拷贝 ``[src_start, src_end]``（终点省略就是到片尾）。"""
+        args = [exe, "-v", "error", "-y", "-ss", f"{src_start:.3f}", "-i", str(source)]
+        if src_end is not None:
+            args += ["-t", f"{src_end - src_start:.3f}"]
+        args += ["-map", "0", "-dn", *copy_args, str(out_path)]
+        run(args, "混合裁剪：流拷贝正文")
+
+    def concat(parts: List[Path], out_path: Path) -> None:
         listing.write_text(
-            f"file '{head}'\nfile '{body}'\n", encoding="utf-8")
+            "".join(f"file '{p}'\n" for p in parts), encoding="utf-8")
         run(
             [exe, "-v", "error", "-y",
              "-f", "concat", "-safe", "0", "-i", str(listing),
              *copy_args,
-             str(target)],
+             str(out_path)],
             "混合裁剪：拼接",
         )
+
+    try:
+        # 1) 开头一小段重编码
+        encode_head(cut_at, head_end, head)
+        # 2) 正文流拷贝（起点就是一个关键帧，能干净地切开）
+        copy_body(head_end, None, body)
+        # 3) 拼起来
+        concat([head, body], target)
+
+        # 4) 拼接可能因为源文件里的坏包被静默截断 —— 长度对不上就自愈
+        if expected > 0 and _duration_of(target) < expected - 2.0:
+            _recover_from_bad_packets(
+                source=source, target=target, head=head, body=body,
+                head_end=head_end, expected=expected,
+                fps=fps, exe=exe, copy_args=copy_args, reencode_args=reencode_args,
+                encode_head=encode_head, copy_body=copy_body, concat=concat,
+                timeout=timeout,
+            )
     finally:
         for tmp in (head, body, listing):
             _safe_unlink(tmp)
+
+
+def _duration_of(path: Path) -> float:
+    try:
+        return ffmpeg.probe(path).duration
+    except ffmpeg.FFmpegError:
+        return 0.0
+
+
+def _recover_from_bad_packets(
+    *,
+    source: Path,
+    target: Path,
+    head: Path,
+    body: Path,
+    head_end: float,
+    expected: float,
+    fps: float,
+    exe: str,
+    copy_args: List[str],
+    reencode_args: List[str],
+    encode_head,
+    copy_body,
+    concat,
+    timeout: int,
+) -> None:
+    """拼接被源文件里的坏包打断时，把坏包附近的那几段重编码再拼一次。
+
+    怎么绕开坏包：先把源文件完整过一遍，让 h264 解析器报出**所有**
+    坏包的位置（一个文件可能有好几处，实测 DVDMS-813 有三处），
+    再按关键帧把正文切成若干段 —— 坏包所在的段整段重编码，其余照旧拷贝。
+
+    重编码的窗口要**比 GOP 宽**：坏包的位置只知道到「秒」，
+    窗口只取前后两个关键帧的话，它有几率被分到旁边的拷贝段里去，
+    白折腾一轮。所以前后各留两个 GOP。
+
+    兜底：如果解析器扫不出坏点（比如坏的不是 h264 流），
+    就按「产物少了多少帧」算出断点位置，绕开那一段。
+    """
+    points = ffmpeg.corrupt_points(source, timeout=min(timeout, 900))
+    if not points:
+        # 扫不出来 —— 用帧数差反推断点
+        n_out = ffmpeg.video_frame_count(target)
+        n_head = ffmpeg.video_frame_count(head)
+        if n_out <= 0 or n_head <= 0 or fps <= 0:
+            raise CutError("拼接产物长度异常，且无法定位断点")
+        n_body = n_out - n_head
+        if n_body <= 0:
+            raise CutError("拼接产物长度异常，且无法定位断点")
+        points = [head_end + n_body / fps]
+
+    # 每个坏点取前后各两个 GOP 的关键帧，整段重编码
+    windows: List[Tuple[float, float]] = []
+    for point in points:
+        probe = ffmpeg.keyframes_between(source, max(0.0, point - 120.0), 240.0)
+        if not probe:
+            continue
+        earlier = [k for k in probe if k < point]
+        later = [k for k in probe if k >= point]
+        kf1 = earlier[-3] if len(earlier) >= 3 else (
+            earlier[-1] if earlier else probe[0])
+        kf2 = later[2] if len(later) >= 3 else (
+            later[-1] if later else probe[-1])
+        if kf2 <= kf1:
+            continue
+        # 窗口不能伸到开头段之前 —— 那段已经被重编码过一次了，
+        # 再来一遍内容就重了（实测会多出整整一段正片）。
+        kf1 = max(kf1, head_end)
+        if kf2 <= kf1:
+            continue
+        windows.append((kf1, kf2))
+    if not windows:
+        raise CutError(
+            f"拼接被坏包打断（{len(points)} 处），但找不到可重编码的切点"
+        )
+
+    # 合并重叠的窗口，免得切出零碎段
+    merged: List[Tuple[float, float]] = []
+    for a, b in sorted(windows):
+        if merged and a <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], b))
+        else:
+            merged.append((a, b))
+
+    # 按重编码窗口把正文切成若干段：窗口内重编码，窗口外照旧拷贝
+    parts: List[Path] = [head]
+    temps: List[Path] = []
+    try:
+        _safe_unlink(body)  # 正文整份已经用不上了，先删掉省磁盘
+        pos = head_end
+        for index, (a, b) in enumerate(merged):
+            if a > pos + 0.05:
+                seg = target.with_name(
+                    f"{target.stem}.adcut-tmp.c{index}{target.suffix}")
+                copy_body(pos, a, seg)
+                temps.append(seg)
+                parts.append(seg)
+            seg = target.with_name(
+                f"{target.stem}.adcut-tmp.r{index}{target.suffix}")
+            probe = ffmpeg.keyframes_between(source, max(0.0, a - 60.0), 120.0)
+            anchor_before = [k for k in probe if k < a - 0.05]
+            encode_head(a, b, seg,
+                        anchor=anchor_before[-1] if anchor_before else None)
+            temps.append(seg)
+            parts.append(seg)
+            pos = max(pos, b)
+        seg = target.with_name(f"{target.stem}.adcut-tmp.tail{target.suffix}")
+        copy_body(pos, None, seg)
+        temps.append(seg)
+        parts.append(seg)
+        concat(parts, target)
+    finally:
+        for tmp in temps:
+            _safe_unlink(tmp)
+
+    got = _duration_of(target)
+    if expected > 0 and got < expected - 2.0:
+        raise CutError(
+            f"拼接仍被坏包打断：期望 {expected:.1f}s，实际 {got:.1f}s"
+            f"（源文件里有 {len(points)} 处坏包）"
+        )
 
 
 def _temp_path(path: Path) -> Path:
@@ -363,6 +543,7 @@ def cut_video(
     try:
         if mode == "hybrid":
             _hybrid_cut(path, temp, cut_at, keyframes, copy_args, reencode_args,
+                        expected=info.duration - cut_at, fps=info.fps,
                         timeout=timeout)
         else:
             _run_cut(path, temp, real_cut, mode, copy_args, reencode_args,
