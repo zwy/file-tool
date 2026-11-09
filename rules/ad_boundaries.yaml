@@ -1,0 +1,274 @@
+version: 1
+description: '人工核验过的逐文件广告边界。
+
+
+  为什么需要这张表：站方推广片是**多卡片轮播**，每支片子插的卡片数不一样，
+
+  广告总长就跟着不一样 —— 同一条模板下的成员实测从 290 到 348 秒都有。
+
+  模板只能记一个长度，套到这些文件上必然切错（实测最多差 53 秒）。
+
+
+  cut_at = **站方推广片的终点**（从片头算起切掉多少秒）。
+
+  1 秒粒度，人工逐帧看拼图 + 指纹跳变交叉验证得出。
+
+
+  site_ad_end 记的是站方广告本身的终点，和 cut_at 相同说明中间没有厂牌片头。
+
+  **厂牌片头 / 作品说明卡按约定保留**（MOGUOY 开场、OCCN 免责声明、
+
+  マジックミラー号 卡、狗头卡、演员档案卡、作品简介卡等），
+
+  所以这些文件的 cut_at 比正片起点早。
+
+
+  分类口径：**带站点二维码/站点 logo 的推广卡算站方广告**；
+
+  **黑底白字的作品简介 / 免责 / 厂牌 logo 卡算厂牌片头，保留**。'
+boundaries:
+- path: AV-174/AV-174.mp4
+  cut_at: 204
+  site_ad_end: 204
+  verified: '2026-11-09'
+  note: 站方推广片到 203 秒结束
+- path: DCV-249/DCV-249.mp4
+  cut_at: 221
+  site_ad_end: 221
+  verified: '2026-11-09'
+  note: 站方推广片到 220 秒结束
+- path: DCV-250/DCV-250.mp4
+  cut_at: 221
+  site_ad_end: 221
+  verified: '2026-11-09'
+  note: 站方推广片到 220 秒结束
+- path: DVDMS-928A/DVDMS-928A.mp4
+  cut_at: 247
+  site_ad_end: 247
+  verified: '2026-11-09'
+  note: 站方推广片到 246 秒结束
+- path: DVMM-012/DVMM-012.mp4
+  cut_at: 319
+  site_ad_end: 319
+  verified: '2026-11-09'
+  note: 站方推广片到 318 秒结束
+- path: DVMM-072/DVMM-072.mp4
+  cut_at: 203
+  site_ad_end: 203
+  verified: '2026-11-09'
+  note: 站方推广片到 202 秒结束；其后是厂牌片头（保留）
+- path: DVMM-148/DVMM-148.mp4
+  cut_at: 235
+  site_ad_end: 235
+  verified: '2026-11-09'
+  note: 站方推广片到 234 秒结束
+- path: DVMM-160/DVMM-160.mp4
+  cut_at: 179
+  site_ad_end: 179
+  verified: '2026-11-09'
+  note: 站方推广片到 178 秒结束
+- path: FFFS-046/FFFS-046.mp4
+  cut_at: 203
+  site_ad_end: 203
+  verified: '2026-11-09'
+  note: 站方推广片到 202 秒结束；其后是厂牌片头（保留）
+- path: HHE-003/HHE-003.mp4
+  cut_at: 211
+  site_ad_end: 211
+  verified: '2026-11-09'
+  note: 站方推广片到 210 秒结束；其后是厂牌片头（保留）
+- path: HJMO-478/HJMO-478.mp4
+  cut_at: 345
+  site_ad_end: 345
+  verified: '2026-11-09'
+  note: 站方推广片到 344 秒结束
+- path: HODV-21651/HODV-21651.mp4
+  cut_at: 275
+  site_ad_end: 275
+  verified: '2026-11-09'
+  note: 站方推广片到 274 秒结束
+- path: HOIZ-030A/HOIZ-030A.mp4
+  cut_at: 263
+  site_ad_end: 263
+  verified: '2026-11-09'
+  note: 站方推广片到 262 秒结束
+- path: KAGP-214A/KAGP-214A.mp4
+  cut_at: 227
+  site_ad_end: 227
+  verified: '2026-11-09'
+  note: 站方推广片到 226 秒结束；其后是厂牌片头（保留）
+- path: KAM-157/KAM-157.mp4
+  cut_at: 234
+  site_ad_end: 234
+  verified: '2026-11-09'
+  note: 站方推广片到 233 秒结束；其后是厂牌片头（保留）
+- path: KAM-159/KAM-159.mp4
+  cut_at: 234
+  site_ad_end: 234
+  verified: '2026-11-09'
+  note: 站方推广片到 233 秒结束；其后是厂牌片头（保留）
+- path: KAM-182/KAM-182.mp4
+  cut_at: 203
+  site_ad_end: 203
+  verified: '2026-11-09'
+  note: 站方推广片到 202 秒结束；其后是厂牌片头（保留）
+- path: MAAN-957/MAAN-957.mp4
+  cut_at: 222
+  site_ad_end: 222
+  verified: '2026-11-09'
+  note: 站方推广片到 221 秒结束
+- path: MIAA-954C/MIAA-954C.mp4
+  cut_at: 290
+  site_ad_end: 290
+  verified: '2026-11-09'
+  note: 站方推广片到 289 秒结束；其后是厂牌片头（保留）
+- path: MIDV-465C/MIDV-465C.mp4
+  cut_at: 291
+  site_ad_end: 291
+  verified: '2026-11-09'
+  note: 站方推广片到 290 秒结束；其后是厂牌片头（保留）
+- path: NHDTB-623A/NHDTB-623A.mp4
+  cut_at: 221
+  site_ad_end: 221
+  verified: '2026-11-09'
+  note: 站方推广片到 220 秒结束；其后是厂牌片头（保留）
+- path: NHDTB-869/NHDTB-869.mp4
+  cut_at: 203
+  site_ad_end: 203
+  verified: '2026-11-09'
+  note: 站方推广片到 202 秒结束；其后是厂牌片头（保留）
+- path: NKKD-333/NKKD-333.mp4
+  cut_at: 204
+  site_ad_end: 204
+  verified: '2026-11-09'
+  note: 站方推广片到 203 秒结束；其后是厂牌片头（保留）
+- path: NTR-068/NTR-068.mp4
+  cut_at: 221
+  site_ad_end: 221
+  verified: '2026-11-09'
+  note: 站方推广片到 220 秒结束；其后是厂牌片头（保留）
+- path: SDMM-028/SDMM-028.mp4
+  cut_at: 291
+  site_ad_end: 291
+  verified: '2026-11-09'
+  note: 站方推广片到 290 秒结束；其后是厂牌片头（保留）
+- path: SDMM-102/SDMM-102.mp4
+  cut_at: 294
+  site_ad_end: 294
+  verified: '2026-11-09'
+  note: 站方推广片到 293 秒结束；其后是厂牌片头（保留）
+- path: SDMM-120C/SDMM-120C.mp4
+  cut_at: 291
+  site_ad_end: 291
+  verified: '2026-11-09'
+  note: 站方推广片到 290 秒结束；其后是厂牌片头（保留）
+- path: SDMM-122C/SDMM-122C.mp4
+  cut_at: 348
+  site_ad_end: 348
+  verified: '2026-11-09'
+  note: 站方推广片到 347 秒结束
+- path: SDMM-126C/SDMM-126C.mp4
+  cut_at: 291
+  site_ad_end: 291
+  verified: '2026-11-09'
+  note: 站方推广片到 290 秒结束；其后是厂牌片头（保留）
+- path: SDMM-147A/SDMM-147A.mp4
+  cut_at: 291
+  site_ad_end: 291
+  verified: '2026-11-09'
+  note: 站方推广片到 290 秒结束；其后是厂牌片头（保留）
+- path: SDMM-147B/SDMM-147B.mp4
+  cut_at: 291
+  site_ad_end: 291
+  verified: '2026-11-09'
+  note: 站方推广片到 290 秒结束；其后是厂牌片头（保留）
+- path: SDMM-147C/SDMM-147C.mp4
+  cut_at: 291
+  site_ad_end: 291
+  verified: '2026-11-09'
+  note: 站方推广片到 290 秒结束；其后是厂牌片头（保留）
+- path: SDMM-149/SDMM-149.mp4
+  cut_at: 208
+  site_ad_end: 208
+  verified: '2026-11-09'
+  note: 站方推广片到 207 秒结束；其后是厂牌片头（保留）
+- path: SPZ-01114/SPZ-01114.mp4
+  cut_at: 268
+  site_ad_end: 268
+  verified: '2026-11-09'
+  note: 站方推广片到 267 秒结束
+- path: SPZ-1093C/SPZ-1093C.mp4
+  cut_at: 20
+  site_ad_end: 20
+  verified: '2026-11-09'
+  note: 站方推广片到 19 秒结束
+- path: SSIS-793/SSIS-793.mp4
+  cut_at: 299
+  site_ad_end: 299
+  verified: '2026-11-09'
+  note: 站方推广片到 298 秒结束；其后是厂牌片头（保留）
+- path: SSIS-863C/SSIS-863C.mp4
+  cut_at: 341
+  site_ad_end: 341
+  verified: '2026-11-09'
+  note: 站方推广片到 340 秒结束
+- path: STSK-108/aavv38.xyz@STSK108A.mp4
+  cut_at: 209
+  site_ad_end: 209
+  verified: '2026-11-09'
+  note: 站方推广片到 208 秒结束
+- path: SVDVD-739/SVDVD-739.mp4
+  cut_at: 339
+  site_ad_end: 339
+  verified: '2026-11-09'
+  note: 站方推广片到 338 秒结束
+- path: SVDVD-888/SVDVD-888.mp4
+  cut_at: 255
+  site_ad_end: 255
+  verified: '2026-11-09'
+  note: 站方推广片到 254 秒结束
+- path: SYS-014/SYS-014.mp4
+  cut_at: 222
+  site_ad_end: 222
+  verified: '2026-11-09'
+  note: 站方推广片到 221 秒结束
+- path: TPPN-241C/TPPN-241C.mp4
+  cut_at: 339
+  site_ad_end: 339
+  verified: '2026-11-09'
+  note: 站方推广片到 338 秒结束
+- path: UMD-875/UMD-875.mp4
+  cut_at: 291
+  site_ad_end: 291
+  verified: '2026-11-09'
+  note: 站方推广片到 290 秒结束；其后是厂牌片头（保留）
+- path: VAL-055/VAL-055.mp4
+  cut_at: 208
+  site_ad_end: 208
+  verified: '2026-11-09'
+  note: 站方推广片到 207 秒结束
+- path: WA-518/WA-518.mp4
+  cut_at: 205
+  site_ad_end: 205
+  verified: '2026-11-09'
+  note: 站方推广片到 204 秒结束
+- path: YRK-020/YRK-020.mp4
+  cut_at: 220
+  site_ad_end: 220
+  verified: '2026-11-09'
+  note: 站方推广片到 219 秒结束
+- path: dvdms-00300a/dvdms-00300a.mp4
+  cut_at: 319
+  site_ad_end: 319
+  verified: '2026-11-09'
+  note: 站方推广片到 318 秒结束
+- path: dvdms-00300b/dvdms-00300b.mp4
+  cut_at: 327
+  site_ad_end: 327
+  verified: '2026-11-09'
+  note: 站方推广片到 326 秒结束
+- path: sdmu-00877b/sdmu-00877b.mp4
+  cut_at: 328
+  site_ad_end: 328
+  verified: '2026-11-09'
+  note: 站方推广片到 327 秒结束

@@ -23,6 +23,7 @@ from file_tool import isolate as isolate_mod
 from file_tool import merge as merge_mod
 from file_tool import rename_files as rename_files_mod
 from file_tool import tidy as tidy_mod
+from file_tool.adcut import boundaries as adcut_boundaries
 from file_tool.adcut import cache as adcut_cache
 from file_tool.adcut import cut as adcut_cut
 from file_tool.adcut import detect as adcut_detect
@@ -35,6 +36,7 @@ from file_tool.tidy import StepKind
 
 DEFAULT_RULES = Path(__file__).resolve().parent.parent / "rules" / "numbering.yaml"
 DEFAULT_AD_TEMPLATES = Path(__file__).resolve().parent.parent / "rules" / "ad_templates.yaml"
+DEFAULT_AD_BOUNDARIES = Path(__file__).resolve().parent.parent / "rules" / "ad_boundaries.yaml"
 
 app = typer.Typer(
     help="本地文件整理 CLI：批量重命名目录、番号规范化",
@@ -891,10 +893,26 @@ def _load_ad_bank(path: Optional[Path]):
         _die(str(exc))
 
 
+def _load_ad_boundaries(path: Optional[Path]):
+    """载入人工核验的逐文件边界表。
+
+    表不存在就当没有 —— 它是可选的增强，不是必需品。
+    """
+    boundaries_path = path or DEFAULT_AD_BOUNDARIES
+    if not boundaries_path.exists():
+        return {}, boundaries_path
+    try:
+        book = adcut_boundaries.load_boundaries(boundaries_path)
+    except adcut_boundaries.BoundaryError as exc:
+        _die(str(exc))
+    return {item.path: item for item in book.boundaries}, boundaries_path
+
+
 @adcut_app.command("scan")
 def adcut_scan(
     root: str = typer.Argument(..., help="要扫描的目录"),
     templates: Optional[Path] = typer.Option(None, "--templates", help="模板库路径"),
+    boundaries: Optional[Path] = typer.Option(None, "--boundaries", help="人工核验边界表路径"),
     head_seconds: float = typer.Option(adcut_detect.DEFAULT_HEAD_SECONDS, "--head-seconds", help="只看开头多少秒"),
     jobs: int = typer.Option(4, "--jobs", help="并发数"),
     limit: int = typer.Option(0, help="最多处理几个视频（0 = 全部）"),
@@ -908,6 +926,7 @@ def adcut_scan(
     """
     root_dir = _resolve_root(root)
     bank, _ = _load_ad_bank(templates)
+    manual_boundaries, _ = _load_ad_boundaries(boundaries)
 
     def progress(done: int, total: int, _path) -> None:
         if not quiet and not json_out and (done % 10 == 0 or done == total):
@@ -915,7 +934,7 @@ def adcut_scan(
 
     plan = adcut_detect.scan_tree(
         root_dir, bank, head_seconds=head_seconds, jobs=jobs, limit=limit,
-        on_progress=progress,
+        on_progress=progress, boundaries=manual_boundaries,
     )
 
     if json_out:
@@ -976,6 +995,7 @@ def _print_detections(items, title: str, color, hint: bool = False) -> None:
 def adcut_cluster(
     root: str = typer.Argument(..., help="要扫描的目录"),
     templates: Optional[Path] = typer.Option(None, "--templates", help="模板库路径"),
+    boundaries: Optional[Path] = typer.Option(None, "--boundaries", help="人工核验边界表路径"),
     head_seconds: float = typer.Option(adcut_detect.DEFAULT_HEAD_SECONDS, "--head-seconds", help="只看开头多少秒"),
     jobs: int = typer.Option(4, "--jobs", help="并发数"),
     json_out: bool = typer.Option(False, "--json", help="以 JSON 输出"),
@@ -988,8 +1008,12 @@ def adcut_cluster(
     """
     root_dir = _resolve_root(root)
     bank, _ = _load_ad_bank(templates)
+    manual_boundaries, _ = _load_ad_boundaries(boundaries)
 
-    plan = adcut_detect.scan_tree(root_dir, bank, head_seconds=head_seconds, jobs=jobs)
+    plan = adcut_detect.scan_tree(
+        root_dir, bank, head_seconds=head_seconds, jobs=jobs,
+        boundaries=manual_boundaries,
+    )
     videos = adcut_detect.find_videos(root_dir)
     signatures = adcut_detect.collect_signatures(
         videos, root_dir, head_seconds=head_seconds
@@ -1166,6 +1190,7 @@ def adcut_cut_cmd(
     root: str = typer.Argument(..., help="要裁剪的目录"),
     apply: bool = typer.Option(False, "--apply", help="真正执行裁剪（默认只预览）"),
     templates: Optional[Path] = typer.Option(None, "--templates", help="模板库路径"),
+    boundaries: Optional[Path] = typer.Option(None, "--boundaries", help="人工核验边界表路径"),
     head_seconds: float = typer.Option(adcut_detect.DEFAULT_HEAD_SECONDS, "--head-seconds", help="只看开头多少秒"),
     jobs: int = typer.Option(4, "--jobs", help="并发扫描数"),
     accurate: bool = typer.Option(False, "--accurate", help="强制重编码，切在精确帧"),
@@ -1180,9 +1205,11 @@ def adcut_cut_cmd(
     """
     root_dir = _resolve_root(root)
     bank, _ = _load_ad_bank(templates)
+    manual_boundaries, _ = _load_ad_boundaries(boundaries)
 
     plan = adcut_detect.scan_tree(
         root_dir, bank, head_seconds=head_seconds, jobs=jobs,
+        boundaries=manual_boundaries,
     )
     targets = plan.cut_items
     if limit:

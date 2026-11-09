@@ -6,6 +6,7 @@
 - :class:`Detection` —— 对**一个视频**的判定结果
 - :class:`AdPlan` —— 对**一批视频**的完整计划（``scan`` / ``cut`` 的产物）
 - :class:`CutOutcome` —— 一次裁剪的执行结果
+- :class:`AdBoundary` / :class:`BoundaryBook` —— 人工核验过的逐文件广告边界
 """
 from __future__ import annotations
 
@@ -226,7 +227,6 @@ class AdPlan(BaseModel):
 
 class CutOutcome(BaseModel):
     """一次裁剪的执行结果。"""
-
     path: str
     ok: bool = False
     mode: str = ""
@@ -239,3 +239,40 @@ class CutOutcome(BaseModel):
     after: float = 0.0
     saved_bytes: int = 0
     reason: str = ""
+
+
+class AdBoundary(BaseModel):
+    """一个文件的人工核验广告边界。
+
+    模板长度是「一支广告有多长」，但站方推广片是多卡片轮播，
+    **每支片子插的卡片数不一样**，广告总长也就跟着不一样。
+    这条记录把某个具体文件的真实终点钉死，覆盖模板长度的推断值。
+    """
+
+    path: str
+    """相对库根目录的 POSIX 路径。"""
+    cut_at: float = 0.0
+    """从片头算起要切掉的秒数 —— 也就是站方广告的终点。"""
+    site_ad_end: float = 0.0
+    """站方推广片本身结束的位置。
+
+    和 ``cut_at`` 可能不同：中间可能还夹着厂牌片头 / 作品说明卡
+    （那部分要不要裁由使用者决定，记在这里备查）。
+    """
+    verified: str = ""
+    """核验日期（YYYY-MM-DD）。"""
+    note: str = ""
+
+
+class BoundaryBook(BaseModel):
+    """逐文件人工核验边界表。"""
+
+    version: int = 1
+    description: str = ""
+    boundaries: List[AdBoundary] = Field(default_factory=list)
+
+    def get(self, path: str) -> Optional[AdBoundary]:
+        for item in self.boundaries:
+            if item.path == path:
+                return item
+        return None

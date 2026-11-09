@@ -41,7 +41,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from . import cache, ffmpeg, fingerprint
-from .models import AdPlan, Cluster, Detection, TemplateBank, TemplateStatus, Verdict
+from .models import AdBoundary, AdPlan, Cluster, Detection, TemplateBank, TemplateStatus, Verdict
 from .templates import is_negative
 
 # 视频扩展名。只认视频 —— 图片（jpg）和字幕不参与广告判定
@@ -122,6 +122,27 @@ def _relative(path: Path, root: Path) -> str:
         return str(path)
 
 
+def _manual_boundary(
+    boundaries: Optional[Dict[str, AdBoundary]],
+    label: str,
+) -> Optional[AdBoundary]:
+    """按相对路径查人工核验边界。
+
+    先精确匹配；扫的是子目录时（相对路径少了几级）退化成后缀匹配，
+    但**只在唯一命中时才算数** —— 同名文件在库里不止一份时宁可不匹配。
+    """
+    if not boundaries:
+        return None
+    item = boundaries.get(label)
+    if item is not None:
+        return item
+    suffix = "/" + label
+    hits = [b for path, b in boundaries.items() if path.endswith(suffix)]
+    if len(hits) == 1:
+        return hits[0]
+    return None
+
+
 def detect_video(
     path: Path,
     bank: TemplateBank,
@@ -131,9 +152,16 @@ def detect_video(
     fps: float = 1.0,
     size: int = ffmpeg.FRAME_SIZE,
     use_cache: bool = True,
+    boundaries: Optional[Dict[str, AdBoundary]] = None,
 ) -> Detection:
-    """判定单个视频。"""
+    """判定单个视频。
+
+    ``boundaries`` 是**人工核验过的逐文件边界**（相对路径 -> 记录）。
+    命中表里有记录的文件时，裁剪点用表里的值，不用模板长度 ——
+    模板记的是「一支广告有多长」，而站方推广片的卡片数每支片子都不一样。
+    """
     label = _relative(path, root) if root else str(path)
+    manual = _manual_boundary(boundaries, label)
 
     try:
         info = ffmpeg.probe(path)
@@ -205,6 +233,19 @@ def detect_video(
 
     if not best_id or best_result.prefix_len < fingerprint.MIN_PREFIX_FRAMES:
         static_ratio = _static_ratio(signature.mad)
+        # 人工核验过的边界是最终裁决 —— 就算模板没匹配上（模板库还没学到
+        # 这支广告），只要人眼量过「站方广告到此为止」，照样该裁。
+        if manual is not None:
+            return Detection(
+                path=label, duration=info.duration, size=info.size,
+                verdict=Verdict.CUT,
+                cut_at=round(manual.cut_at, 3),
+                confidence=1.0,
+                static_ratio=round(static_ratio, 3),
+                reason=(
+                    f"片头没匹配到已知模板，但采用人工核验边界 {manual.cut_at:.0f}s"
+                ),
+            )
         note = ""
         if static_ratio >= 0.6:
             note = (
@@ -237,6 +278,23 @@ def detect_video(
     offset = best_result.offset
     if offset + template_len > len(signature.hashes):
         # 片头窗口不够长，装不下整条模板 —— 不能判
+        # 但人工核验过边界的文件不受窗口限制：边界是量出来的，不是猜的。
+        if manual is not None:
+            return Detection(
+                path=label, duration=info.duration, size=info.size,
+                verdict=Verdict.CUT,
+                template_id=best_id,
+                template_label=best_label,
+                matched_frames=best_result.prefix_len,
+                template_frames=template_len,
+                coverage=round(best_result.coverage, 4),
+                cut_at=round(manual.cut_at, 3),
+                confidence=1.0,
+                reason=(
+                    f"匹配 {best_label or best_id}，片头窗口（{head_seconds:.0f}s）"
+                    f"装不下模板；采用人工核验边界 {manual.cut_at:.0f}s"
+                ),
+            )
         return Detection(
             path=label, duration=info.duration, size=info.size,
             verdict=Verdict.REVIEW,
@@ -272,7 +330,31 @@ def detect_video(
     )
     if offset:
         reason += f"，广告从第 {offset} 秒开始"
-    if mad_value >= 12.0:
+
+    # ---- 人工核验边界优先 ----
+    #
+    # 模板长度是「一支广告有多长」，但站方推广片是多卡片轮播，
+    # 每支片子插的卡片数不一样 —— 同一条模板下的成员实测从 291 到
+    # 348 秒都有。按模板长度裁，短的要留下几十秒广告尾巴。
+    #
+    # 人工核验过的边界直接覆盖模板长度的推断值，并且不再受
+    # 「硬切 / 无硬切」这个启发式的影响 —— 边界是量出来的。
+    if manual is not None:
+        old_cut = cut_at
+        cut_at = manual.cut_at
+        cut_frame = int(round(cut_at * fps)) if fps else cut_frame
+        mad_value = signature.mad[cut_frame] if 0 <= cut_frame < len(signature.mad) else 0.0
+        verdict = Verdict.CUT
+        confidence = 1.0
+        reason = (
+            f"匹配 {best_label or best_id}（连续 {best_result.prefix_len}/{template_len} 帧）；"
+            f"采用人工核验边界 {cut_at:.0f}s"
+            + (f"（模板长度推断为 {old_cut:.0f}s）" if abs(old_cut - cut_at) >= 1 else "")
+        )
+        if manual.note:
+            reason += f"；{manual.note}"
+        incomplete = False
+    elif mad_value >= 12.0:
         reason += f"，裁剪点处画面差异 {mad_value:.0f}（硬切，可信）"
     else:
         reason += f"，裁剪点处画面差异仅 {mad_value:.0f}（无明显硬切，需人工确认）"
@@ -423,8 +505,13 @@ def scan_tree(
     recursive: bool = True,
     use_cache: bool = True,
     on_progress=None,
+    boundaries: Optional[Dict[str, AdBoundary]] = None,
 ) -> AdPlan:
-    """扫描整个目录，返回完整计划。"""
+    """扫描整个目录，返回完整计划。
+
+    ``boundaries`` 是人工核验过的逐文件边界（相对路径 -> 记录），
+    命中时用它替代模板长度算出的裁剪点。
+    """
     videos = find_videos(root, recursive=recursive)
     if limit:
         videos = videos[:limit]
@@ -434,7 +521,7 @@ def scan_tree(
     def work(path: Path) -> Detection:
         return detect_video(
             path, bank, root=root, head_seconds=head_seconds,
-            tolerance=tolerance, use_cache=use_cache,
+            tolerance=tolerance, use_cache=use_cache, boundaries=boundaries,
         )
 
     workers = max(1, min(jobs, 8))
