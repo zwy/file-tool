@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import sys
 from pathlib import Path
@@ -1192,7 +1193,7 @@ def adcut_cut_cmd(
     templates: Optional[Path] = typer.Option(None, "--templates", help="模板库路径"),
     boundaries: Optional[Path] = typer.Option(None, "--boundaries", help="人工核验边界表路径"),
     head_seconds: float = typer.Option(adcut_detect.DEFAULT_HEAD_SECONDS, "--head-seconds", help="只看开头多少秒"),
-    jobs: int = typer.Option(4, "--jobs", help="并发扫描数"),
+    jobs: int = typer.Option(4, "--jobs", help="并发数（扫描与裁剪都算）"),
     accurate: bool = typer.Option(False, "--accurate", help="强制重编码，切在精确帧"),
     max_snap: float = typer.Option(2.0, "--max-snap", help="关键帧吸附上限（秒）"),
     limit: int = typer.Option(0, help="最多裁几个（0 = 全部）"),
@@ -1223,7 +1224,7 @@ def adcut_cut_cmd(
             "targets": [d.model_dump(mode="json") for d in targets],
         }
         if apply:
-            outcomes = _run_cuts(root_dir, targets, max_snap, accurate)
+            outcomes = _run_cuts(root_dir, targets, max_snap, accurate, jobs)
             payload["ok"] = sum(1 for o in outcomes if o.ok)
             payload["failed"] = sum(1 for o in outcomes if not o.ok)
             payload["outcomes"] = [o.model_dump(mode="json") for o in outcomes]
@@ -1255,7 +1256,7 @@ def adcut_cut_cmd(
         )
         return
 
-    outcomes = _run_cuts(root_dir, targets, max_snap, accurate)
+    outcomes = _run_cuts(root_dir, targets, max_snap, accurate, jobs)
     ok = sum(1 for o in outcomes if o.ok)
     failed = len(outcomes) - ok
 
@@ -1271,19 +1272,30 @@ def adcut_cut_cmd(
     )
 
 
-def _run_cuts(root_dir: Path, targets, max_snap: float, accurate: bool):
-    """按计划逐个裁剪。"""
-    outcomes = []
-    for item in targets:
+def _run_cuts(root_dir: Path, targets, max_snap: float, accurate: bool, jobs: int = 1):
+    """按计划逐个裁剪。
+
+    ``jobs > 1`` 时并发裁。裁剪本身是「ffmpeg 子进程 + 临时文件」，
+    瓶颈在磁盘 I/O 和编码，不在 Python —— 所以用线程池就够了
+    （``cut_video`` 全程在 ``subprocess.run`` 里等，解释器能腾出手来）。
+
+    实测：有几支的关键帧离裁剪点太远，只能重编码切在精确帧上，
+    单支要二三十分钟。串行的话全库要四五个小时，并发能压到一小时以内。
+    """
+    def one(item):
         path = Path(item.path)
         if not path.is_absolute():
             path = root_dir / path
-        outcomes.append(
-            adcut_cut.cut_video(
-                path, cut_at=item.cut_at, max_snap=max_snap, accurate=accurate,
-            )
+        return adcut_cut.cut_video(
+            path, cut_at=item.cut_at, max_snap=max_snap, accurate=accurate,
         )
-    return outcomes
+
+    if jobs <= 1 or len(targets) <= 1:
+        return [one(item) for item in targets]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
+        # 保持和输入一样的顺序，输出才好读
+        return list(pool.map(one, targets))
 
 
 @adcut_app.command("sheet")

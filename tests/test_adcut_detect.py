@@ -71,6 +71,23 @@ def make_video_with_prelude(
     return path
 
 
+def make_sparse_keyframe_video(path: Path, seconds: int = 20) -> Path:
+    """造一段关键帧稀疏的视频（每 5 秒一个）。
+
+    用来逼出「裁剪点附近没有关键帧」的情况 —— 那时必须走混合裁剪，
+    而不是整部重编码。
+    """
+    cmd = [
+        ffmpeg.require_executable("ffmpeg"), "-v", "error", "-y",
+        "-f", "lavfi", "-i",
+        f"testsrc2=size=320x240:rate=10:duration={seconds}",
+        "-g", "50", "-keyint_min", "50", "-sc_threshold", "0",
+        str(path),
+    ]
+    subprocess.run(cmd, capture_output=True, check=True, timeout=120)
+    return path
+
+
 @pytest.fixture()
 def ad_bank(tmp_path: Path) -> TemplateBank:
     """一个模板库里有一条学好的广告模板。"""
@@ -250,25 +267,32 @@ class TestConfidence:
 
 
 class TestPlanCutPoint:
-    def test_prefers_keyframe_after_cut(self):
-        """切割点之后有关键帧 —— 用它，广告切得干净。"""
-        real, mode, snap = cut_mod.plan_cut_point(10.0, [0.0, 8.0, 11.0, 20.0])
-        assert real == 11.0
+    def test_uses_nearby_keyframe(self):
+        """关键帧离裁剪点够近 —— 无损流拷贝，误差在容忍范围内。"""
+        real, mode, snap = cut_mod.plan_cut_point(10.0, [0.0, 8.0, 10.2, 20.0])
+        assert real == 10.2
         assert mode == "copy"
-        assert snap == pytest.approx(1.0)
+        assert snap == pytest.approx(0.2)
 
-    def test_falls_back_to_keyframe_before(self):
-        """之后的关键帧太远 —— 用之前的那个，会留一截广告尾巴。"""
-        real, mode, snap = cut_mod.plan_cut_point(10.0, [0.0, 9.5, 30.0])
-        assert real == 9.5
+    def test_prefers_the_closest_keyframe(self):
+        """前后都有关键帧 —— 取最近的那个，误差最小。"""
+        real, mode, snap = cut_mod.plan_cut_point(10.0, [0.0, 9.8, 11.0])
+        assert real == 9.8
         assert mode == "copy"
-        assert snap == pytest.approx(-0.5)
+        assert snap == pytest.approx(-0.2)
 
-    def test_reencode_when_too_far(self):
-        """两边都远 —— 重编码，切在精确位置。"""
+    def test_hybrid_when_no_keyframe_is_close(self):
+        """关键帧都离得远 —— 混合裁剪：精确切在裁剪点，又不用整部重编码。"""
         real, mode, snap = cut_mod.plan_cut_point(10.0, [0.0, 40.0])
         assert real == 10.0
-        assert mode == "reencode"
+        assert mode == "hybrid"
+        assert snap == 0.0
+
+    def test_hybrid_when_keyframe_error_is_too_big(self):
+        """关键帧差 1.8 秒 —— 误差看得见，宁可混合裁剪切精确。"""
+        real, mode, snap = cut_mod.plan_cut_point(10.0, [0.0, 8.2, 40.0])
+        assert real == 10.0
+        assert mode == "hybrid"
         assert snap == 0.0
 
     def test_zero_cut_is_rejected(self):
@@ -308,6 +332,36 @@ class TestCut:
         leftovers = [item.name for item in tmp_path.iterdir()
                      if cut_mod.TEMP_MARK in item.name]
         assert leftovers == []
+
+    def test_hybrid_cut_lands_exactly_on_cut_point(self, tmp_path: Path):
+        """裁剪点附近没有关键帧时走混合裁剪。
+
+        要验两件事：
+        1. 切点是**精确**的 —— 不能退化成「切在最近的关键帧上」；
+        2. 不用整部重编码 —— 混合模式下只有开头几秒被重新编码。
+        """
+        video = make_sparse_keyframe_video(tmp_path / "a.mp4")
+        before = ffmpeg.probe(video).duration
+        outcome = cut_mod.cut_video(video, cut_at=7.0)
+        assert outcome.ok, outcome.reason
+        assert outcome.mode == "hybrid"
+        after = ffmpeg.probe(video).duration
+        # 关键帧在 0/5/10/15 —— 切 7.0 秒只有混合裁剪能切准
+        assert before - after == pytest.approx(7.0, abs=0.5)
+
+    def test_hybrid_cut_leaves_no_temp_files(self, tmp_path: Path):
+        video = make_sparse_keyframe_video(tmp_path / "a.mp4")
+        cut_mod.cut_video(video, cut_at=7.0)
+        leftovers = [item.name for item in tmp_path.iterdir()
+                     if cut_mod.TEMP_MARK in item.name]
+        assert leftovers == []
+
+    def test_hybrid_cut_result_is_playable(self, tmp_path: Path):
+        video = make_sparse_keyframe_video(tmp_path / "a.mp4")
+        assert cut_mod.cut_video(video, cut_at=7.0).ok
+        info = ffmpeg.probe(video)
+        assert info.has_video
+        assert info.duration > 0
 
     def test_missing_file_is_reported(self, tmp_path: Path):
         outcome = cut_mod.cut_video(tmp_path / "nope.mp4", cut_at=5.0)
